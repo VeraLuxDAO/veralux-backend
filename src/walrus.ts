@@ -2,7 +2,6 @@ import 'dotenv/config';
 import { getFullnodeUrl, SuiClient } from '@mysten/sui/client';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { WalrusClient, WalrusFile } from '@mysten/walrus';
-import { encode } from 'node:punycode';
 
 const SUI_URL = process.env.SUI_FULLNODE_URL || getFullnodeUrl(process.env.SUI_NETWORK as 'testnet' | 'mainnet' || 'testnet');
 const DEV_NOCHAIN = (process.env.WALRUS_DEV_NOCHAIN === 'true');

@@ -13,10 +13,59 @@ const walrusClient = new WalrusClient({
 });
 
 function getSigner() {
-  const base64 = process.env.SUI_SECRET_KEY_BASE64;
-  if (!base64) throw new Error('Missing SUI_SECRET_KEY_BASE64 in .env');
-  const bytes = Buffer.from(base64, 'base64');
-  return Ed25519Keypair.fromSecretKey(bytes);
+  const seed = getSecretSeedFromEnv(); // returns Uint8Array(32)
+  return Ed25519Keypair.fromSecretKey(seed);
+}
+
+function getSecretSeedFromEnv(): Uint8Array {
+  const b64 = process.env.SUI_SECRET_KEY_BASE64?.trim();
+  const hex = process.env.SUI_SECRET_KEY_HEX?.trim();
+  const any = process.env.SUI_SECRET_KEY?.trim();
+
+  // Helper
+  const asHexBytes = (h: string) => {
+    const clean = h.startsWith('0x') ? h.slice(2) : h;
+    if (clean.length % 2 !== 0) throw new Error('Odd-length hex');
+    return Uint8Array.from(Buffer.from(clean, 'hex'));
+  };
+
+  // 1) Prefer explicit base64 seed
+  if (b64) {
+    const bytes = Buffer.from(b64, 'base64');
+    if (bytes.length === 32) return new Uint8Array(bytes);
+    if (bytes.length === 64) return new Uint8Array(bytes.slice(0, 32)); // handle 64-byte private keys
+    // Sometimes users paste hex *as* base64; detect and convert:
+    const maybeAscii = Buffer.from(b64, 'base64').toString('utf8').trim();
+    if (/^0x[0-9a-fA-F]+$/.test(maybeAscii) || /^[0-9a-fA-F]+$/.test(maybeAscii)) {
+      const hb = asHexBytes(maybeAscii);
+      if (hb.length === 32) return hb;
+      if (hb.length === 64) return hb.slice(0, 32);
+    }
+    throw new Error(`Invalid SUI_SECRET_KEY_BASE64 length: ${bytes.length}. Needs 32.`);
+  }
+
+  // 2) Hex seed
+  if (hex) {
+    const hb = asHexBytes(hex);
+    if (hb.length === 32) return hb;
+    if (hb.length === 64) return hb.slice(0, 32);
+    throw new Error(`Invalid SUI_SECRET_KEY_HEX length: ${hb.length}. Needs 32.`);
+  }
+
+  // 3) Fallback auto-detect
+  if (any) {
+    if (/^0x?[0-9a-fA-F]+$/.test(any)) {
+      const hb = asHexBytes(any);
+      if (hb.length === 32) return hb;
+      if (hb.length === 64) return hb.slice(0, 32);
+    } else {
+      const bb = Buffer.from(any, 'base64');
+      if (bb.length === 32) return new Uint8Array(bb);
+      if (bb.length === 64) return new Uint8Array(bb.slice(0, 32));
+    }
+  }
+
+  throw new Error('Missing SUI secret key. Set SUI_SECRET_KEY_BASE64 or SUI_SECRET_KEY_HEX.');
 }
 
 export async function storeText(content: string) {

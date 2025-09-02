@@ -1,9 +1,14 @@
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 
-const keypair = new Ed25519Keypair();
-const secret = Buffer.from(keypair.getSecretKey()).toString('base64');
-const address = keypair.getPublicKey().toSuiAddress();
+const kp = new Ed25519Keypair();
+// getSecretKey() typically returns 64 bytes (priv + pub). Use first 32 as seed:
+const full = kp.getSecretKey();
+const seed32 = full.slice(0, 32);
 
-console.log('SUI Address:', address);
-console.log('SUI_SECRET_KEY_BASE64:', secret);
-console.log('\nPaste SUI_SECRET_KEY_BASE64 into your .env');
+const b64 = Buffer.from(seed32).toString('base64');
+const hex = Buffer.from(seed32).toString('hex');
+
+console.log('SUI Address:', kp.getPublicKey().toSuiAddress());
+console.log('SUI_SECRET_KEY_BASE64:', b64);
+console.log('SUI_SECRET_KEY_HEX:', '0x' + hex);
+console.log('\nUse either env var. Fund this address with testnet SUI + WAL.');

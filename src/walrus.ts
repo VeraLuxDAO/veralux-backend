@@ -1,94 +1,84 @@
-import 'dotenv/config';
-import { getFullnodeUrl, SuiClient } from '@mysten/sui/client';
-import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { WalrusClient, WalrusFile } from '@mysten/walrus';
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import axios from "axios";
+import type { ActionObject, FlowObject, WalrusHash } from "./types.js";
 
-const SUI_URL = process.env.SUI_FULLNODE_URL || getFullnodeUrl(process.env.SUI_NETWORK as 'testnet' | 'mainnet' || 'testnet');
-const DEV_NOCHAIN = (process.env.WALRUS_DEV_NOCHAIN === 'true');
+const MODE = process.env.WALRUS_MODE ?? "mock"; // mock | real
+const BASE = process.env.WALRUS_BASE_URL ?? "http://localhost:3001";
+const DATA_DIR = path.resolve(process.cwd(), "data", "walrus");
 
-const suiClient = new SuiClient({ url: SUI_URL });
-const walrusClient = new WalrusClient({
-  network: (process.env.SUI_NETWORK as 'testnet' | 'mainnet') || 'testnet',
-  suiClient,
-});
-
-function getSigner() {
-  const seed = getSecretSeedFromEnv(); // returns Uint8Array(32)
-  return Ed25519Keypair.fromSecretKey(seed);
+async function ensureDir() {
+  await fs.mkdir(DATA_DIR, { recursive: true });
 }
 
-function getSecretSeedFromEnv(): Uint8Array {
-  const b64 = process.env.SUI_SECRET_KEY_BASE64?.trim();
-  const hex = process.env.SUI_SECRET_KEY_HEX?.trim();
-  const any = process.env.SUI_SECRET_KEY?.trim();
-
-  // Helper
-  const asHexBytes = (h: string) => {
-    const clean = h.startsWith('0x') ? h.slice(2) : h;
-    if (clean.length % 2 !== 0) throw new Error('Odd-length hex');
-    return Uint8Array.from(Buffer.from(clean, 'hex'));
-  };
-
-  // 1) Prefer explicit base64 seed
-  if (b64) {
-    const bytes = Buffer.from(b64, 'base64');
-    if (bytes.length === 32) return new Uint8Array(bytes);
-    if (bytes.length === 64) return new Uint8Array(bytes.slice(0, 32)); // handle 64-byte private keys
-    // Sometimes users paste hex *as* base64; detect and convert:
-    const maybeAscii = Buffer.from(b64, 'base64').toString('utf8').trim();
-    if (/^0x[0-9a-fA-F]+$/.test(maybeAscii) || /^[0-9a-fA-F]+$/.test(maybeAscii)) {
-      const hb = asHexBytes(maybeAscii);
-      if (hb.length === 32) return hb;
-      if (hb.length === 64) return hb.slice(0, 32);
-    }
-    throw new Error(`Invalid SUI_SECRET_KEY_BASE64 length: ${bytes.length}. Needs 32.`);
-  }
-
-  // 2) Hex seed
-  if (hex) {
-    const hb = asHexBytes(hex);
-    if (hb.length === 32) return hb;
-    if (hb.length === 64) return hb.slice(0, 32);
-    throw new Error(`Invalid SUI_SECRET_KEY_HEX length: ${hb.length}. Needs 32.`);
-  }
-
-  // 3) Fallback auto-detect
-  if (any) {
-    if (/^0x?[0-9a-fA-F]+$/.test(any)) {
-      const hb = asHexBytes(any);
-      if (hb.length === 32) return hb;
-      if (hb.length === 64) return hb.slice(0, 32);
-    } else {
-      const bb = Buffer.from(any, 'base64');
-      if (bb.length === 32) return new Uint8Array(bb);
-      if (bb.length === 64) return new Uint8Array(bb.slice(0, 32));
-    }
-  }
-
-  throw new Error('Missing SUI secret key. Set SUI_SECRET_KEY_BASE64 or SUI_SECRET_KEY_HEX.');
+function sha256(buffer: Buffer): WalrusHash {
+  return crypto.createHash("sha256").update(buffer).digest("hex");
 }
 
-export async function storeText(content: string) {
-  if (DEV_NOCHAIN) {
-    const crypto = await import('node:crypto');
-    const hash = crypto.createHash('sha256').update(content).digest('hex');
-    return { ok: true, mode: 'dev-nochain', hash };
+export interface IWalrus {
+  putRaw(buffer: Buffer): Promise<WalrusHash>;
+  getRaw(hash: WalrusHash): Promise<Buffer>;
+  putJson<T extends object>(obj: T): Promise<WalrusHash>;
+  getJson<T = unknown>(hash: WalrusHash): Promise<T>;
+}
+
+class MockWalrus implements IWalrus {
+  async putRaw(buffer: Buffer): Promise<WalrusHash> {
+    await ensureDir();
+    const hash = sha256(buffer);
+    await fs.writeFile(path.join(DATA_DIR, hash), buffer);
+    return hash;
   }
+  async getRaw(hash: WalrusHash): Promise<Buffer> {
+    return fs.readFile(path.join(DATA_DIR, hash));
+  }
+  async putJson<T extends object>(obj: T): Promise<WalrusHash> {
+    const buf = Buffer.from(JSON.stringify(obj));
+    return this.putRaw(buf);
+  }
+  async getJson<T = unknown>(hash: WalrusHash): Promise<T> {
+    const buf = await this.getRaw(hash);
+    return JSON.parse(buf.toString("utf8")) as T;
+  }
+}
 
-  const file = WalrusFile.from({
-    contents: new TextEncoder().encode(content),
-    identifier: 'flow.txt',
-    tags: { 'content-type': 'text/plain' },
-  });
+class RealWalrus implements IWalrus {
+  // Placeholder: adapt to your Walrus node’s API
+  async putRaw(buffer: Buffer): Promise<WalrusHash> {
+    const res = await axios.post(`${BASE}/upload`, buffer, {
+      headers: { "Content-Type": "application/octet-stream", "x-api-key": process.env.WALRUS_API_KEY ?? "" }
+    });
+    return res.data.hash as WalrusHash;
+  }
+  async getRaw(hash: WalrusHash): Promise<Buffer> {
+    const res = await axios.get(`${BASE}/object/${hash}`, { responseType: "arraybuffer" });
+    return Buffer.from(res.data);
+  }
+  async putJson<T extends object>(obj: T): Promise<WalrusHash> {
+    const res = await axios.post(`${BASE}/uploadJson`, obj, {
+      headers: { "Content-Type": "application/json", "x-api-key": process.env.WALRUS_API_KEY ?? "" }
+    });
+    return res.data.hash as WalrusHash;
+  }
+  async getJson<T = unknown>(hash: WalrusHash): Promise<T> {
+    const res = await axios.get(`${BASE}/json/${hash}`);
+    return res.data as T;
+  }
+}
 
-  const signer = getSigner();
-  const results = await walrusClient.writeFiles({
-    files: [file],
-    epochs: 3,
-    deletable: true,
-    signer,
-  });
+export const walrus: IWalrus = MODE === "real" ? new RealWalrus() : new MockWalrus();
 
-  const { id: quiltId, blobId } = results[0]!;
-  return { ok: true, mode: 'walrus', quiltId, blobId };
+// High-level helpers
+
+export async function storeFlowObject(obj: FlowObject): Promise<WalrusHash> {
+  return walrus.putJson(obj);
+}
+
+export async function loadFlowObject(hash: WalrusHash): Promise<FlowObject> {
+  return walrus.getJson<FlowObject>(hash);
+}
+
+export async function storeActionObject(obj: ActionObject): Promise<WalrusHash> {
+  return walrus.putJson(obj);
 }

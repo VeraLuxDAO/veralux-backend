@@ -1,9 +1,58 @@
-datasource db { provider = "sqlite"; url = "file:./dev.db" }
-generator client { provider = "prisma-client-js" }
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum FlowType {
+  TEXT
+  IMAGE
+}
 
 model Flow {
-  id           String @id @default(cuid())
-  userId       String?
-  contentHash  String  // walrus blobId or sha256 in dev-nochain
-  createdAt    DateTime @default(now())
+  id          String   @id @default(cuid())
+  type        FlowType
+  walrusHash  String   @unique
+  imageHash   String?  // if type=IMAGE, points to raw image blob in Walrus
+  mime        String?
+  createdAt   DateTime @default(now())
+  authorId    String?  // optional user
+}
+
+model Glow {
+  id          String   @id @default(cuid())
+  flowHash    String   // references Flow.walrusHash
+  walrusHash  String   // glow log in Walrus (immutable)
+  actorId     String?
+  createdAt   DateTime @default(now())
+  @@index([flowHash])
+}
+
+model Promote {
+  id              String   @id @default(cuid())
+  flowHash        String
+  walrusHash      String
+  visibilityBoost Int      @default(10)
+  actorId         String?
+  createdAt       DateTime @default(now())
+  @@index([flowHash])
+}
+
+model Group {
+  id         String   @id @default(cuid()) // off-chain id
+  groupId    String   @unique              // on-chain id or stubbed
+  type       String                         // "room" | "circle"
+  name       String
+  createdAt  DateTime @default(now())
+}
+
+model Membership {
+  id        String   @id @default(cuid())
+  groupId   String
+  memberId  String
+  createdAt DateTime @default(now())
+  @@index([groupId])
 }

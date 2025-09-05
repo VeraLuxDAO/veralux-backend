@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import axios from "axios";
-import type { ActionObject, FlowObject, WalrusHash } from "./types.js";
+import type { ActionObject, ChatObject, FlowObject, GroupMetaObject, WalrusHash } from "./types.js";
 
 const MODE = process.env.WALRUS_MODE ?? "mock"; // mock | real
 const BASE = process.env.WALRUS_BASE_URL ?? "http://localhost:3001";
@@ -11,7 +11,6 @@ const DATA_DIR = path.resolve(process.cwd(), "data", "walrus");
 async function ensureDir() {
   await fs.mkdir(DATA_DIR, { recursive: true });
 }
-
 function sha256(buffer: Buffer): WalrusHash {
   return crypto.createHash("sha256").update(buffer).digest("hex");
 }
@@ -44,7 +43,6 @@ class MockWalrus implements IWalrus {
 }
 
 class RealWalrus implements IWalrus {
-  // Placeholder: adapt to your Walrus node’s API
   async putRaw(buffer: Buffer): Promise<WalrusHash> {
     const res = await axios.post(`${BASE}/upload`, buffer, {
       headers: { "Content-Type": "application/octet-stream", "x-api-key": process.env.WALRUS_API_KEY ?? "" }
@@ -69,16 +67,10 @@ class RealWalrus implements IWalrus {
 
 export const walrus: IWalrus = MODE === "real" ? new RealWalrus() : new MockWalrus();
 
-// High-level helpers
+// high-level helpers
+export const storeFlowObject = (obj: FlowObject) => walrus.putJson(obj);
+export const loadFlowObject = (hash: WalrusHash) => walrus.getJson<FlowObject>(hash);
 
-export async function storeFlowObject(obj: FlowObject): Promise<WalrusHash> {
-  return walrus.putJson(obj);
-}
-
-export async function loadFlowObject(hash: WalrusHash): Promise<FlowObject> {
-  return walrus.getJson<FlowObject>(hash);
-}
-
-export async function storeActionObject(obj: ActionObject): Promise<WalrusHash> {
-  return walrus.putJson(obj);
-}
+export const storeActionObject = (obj: ActionObject) => walrus.putJson(obj);
+export const storeChatObject = (obj: ChatObject) => walrus.putJson(obj);
+export const storeGroupMeta = (obj: GroupMetaObject) => walrus.putJson(obj);

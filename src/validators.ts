@@ -1,18 +1,46 @@
 import { z } from "zod";
 
-const linkRegex = /(https?:\/\/|www\.)/i;
+const urlRegex = /(https?:\/\/[^\s]+)/gi;
 
-export function assertNoLinks(text?: string) {
+export function parseAllowedHosts(): string[] {
+  const raw = process.env.ALLOWED_LINK_HOSTS ?? "";
+  return raw
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+/**
+ * Blocks any http/https links unless host is in ALLOWED_LINK_HOSTS.
+ * If ALLOWED_LINK_HOSTS is empty => blocks all external links.
+ */
+export function assertNoExternalLinks(text?: string) {
   if (!text) return;
-  if (linkRegex.test(text)) {
-    const error = new Error("Links are not allowed in text (no 'http'/'https').");
-    (error as any).status = 400;
-    throw error;
+  const matches = text.match(urlRegex);
+  if (!matches) return;
+
+  const allowed = new Set(parseAllowedHosts());
+  for (const m of matches) {
+    try {
+      const u = new URL(m);
+      const host = u.hostname.toLowerCase();
+      if (!allowed.size || !allowed.has(host)) {
+        const err = new Error(
+          "External links are not allowed. Only permitted hosts in ALLOWED_LINK_HOSTS may be used."
+        );
+        (err as any).status = 400;
+        throw err;
+      }
+    } catch {
+      const err = new Error("Invalid URL detected in text.");
+      (err as any).status = 400;
+      throw err;
+    }
   }
 }
 
 export const postFlowTextSchema = z.object({
-  text: z.string().min(1, "text is required").max(2000)
+  text: z.string().min(1).max(2000)
 });
 
 export const postGlowSchema = z.object({
@@ -33,4 +61,10 @@ export const postGroupSchema = z.object({
 export const postJoinSchema = z.object({
   groupId: z.string().min(1),
   memberId: z.string().min(1)
+});
+
+export const postChatSchema = z.object({
+  text: z.string().min(1).max(2000),
+  groupId: z.string().optional(),
+  actorId: z.string().optional()
 });

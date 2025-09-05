@@ -1,40 +1,87 @@
 import "dotenv/config";
 import express from "express";
+import cors from "cors";
 import multer from "multer";
 import { PrismaClient } from "@prisma/client";
-import { assertNoLinks, postFlowTextSchema, postGlowSchema, postPromoteSchema, postGroupSchema, postJoinSchema } from "./validators.js";
-import { loadFlowObject, storeActionObject, storeFlowObject, walrus } from "./walrus.js";
-import { create_group, join_group, log_action } from "./blockchain.js";
-import type { FlowObject, ActionObject, WalrusHash } from "./types.js";
+import {
+  assertNoExternalLinks,
+  postChatSchema,
+  postFlowTextSchema,
+  postGlowSchema,
+  postGroupSchema,
+  postJoinSchema,
+  postPromoteSchema
+} from "./validators.js";
+import {
+  loadFlowObject,
+  storeActionObject,
+  storeChatObject,
+  storeFlowObject,
+  storeGroupMeta,
+  walrus
+} from "./walrus.js";
+import { create_group, join_group, log_action, onChainEvent, verify_action } from "./blockchain.js";
+import type { ActionObject, ChatObject, FlowObject, GroupMetaObject, WalrusHash } from "./types.js";
+import { ActionType } from "./types.js";
 
 const prisma = new PrismaClient();
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
 
+app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
+/* ------------------------------ SSE: /events ------------------------------ */
+type SSEClient = { id: number; res: express.Response };
+const clients = new Map<number, SSEClient>();
+let nextClientId = 1;
+
+app.get("/events", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+  const id = nextClientId++;
+  clients.set(id, { id, res });
+
+  // Heartbeat
+  const iv = setInterval(() => res.write(`event: ping\ndata: {}\n\n`), 15000);
+
+  req.on("close", () => {
+    clearInterval(iv);
+    clients.delete(id);
+  });
+});
+
+function broadcast(e: unknown) {
+  const payload = `data: ${JSON.stringify(e)}\n\n`;
+  clients.forEach(({ res }) => res.write(payload));
+}
+onChainEvent((e) => broadcast(e)); // tie chain events to SSE
+
+/* -------------------------------- FLOWS ---------------------------------- */
 /**
  * POST /flows
- * - JSON {text} OR multipart "image" (file) + optional "caption"
- * - Stores content in Walrus, returns flow hash
- * - Validates: no links in text/caption
+ * - JSON {text} OR multipart("image") + optional caption
+ * - Stores in Walrus; logs FLOW to chain; indexes minimal metadata
  */
 app.post("/flows", upload.single("image"), async (req, res, next) => {
   try {
-    const now = new Date().toISOString();
+    const nowISO = new Date().toISOString();
 
     if (req.is("application/json")) {
       const parsed = postFlowTextSchema.parse(req.body);
-      assertNoLinks(parsed.text);
+      assertNoExternalLinks(parsed.text);
 
-      const flowObj: FlowObject = { kind: "flow", type: "TEXT", text: parsed.text, createdAt: now };
+      const flowObj: FlowObject = { kind: "flow", type: "TEXT", text: parsed.text, createdAt: nowISO };
       const flowHash = await storeFlowObject(flowObj);
 
       await prisma.flow.create({
         data: { type: "TEXT", walrusHash: flowHash, createdAt: new Date() }
       });
 
-      return res.status(201).json({ ok: true, hash: flowHash, type: "TEXT" });
+      const tx = await log_action(ActionType.FLOW, flowHash);
+      return res.status(201).json({ ok: true, hash: flowHash, type: "TEXT", tx });
     }
 
     // multipart: image
@@ -42,42 +89,31 @@ app.post("/flows", upload.single("image"), async (req, res, next) => {
       return res.status(400).json({ ok: false, error: "Provide JSON {text} or multipart with 'image'." });
     }
     const caption = (req.body?.caption ?? "").toString();
-    assertNoLinks(caption);
+    assertNoExternalLinks(caption);
 
-    // store raw image first
     const imageHash = await walrus.putRaw(req.file.buffer);
-
     const flowObj: FlowObject = {
       kind: "flow",
       type: "IMAGE",
       imageHash,
       mime: req.file.mimetype,
-      ...(caption ? { text: caption } : {}),
-      createdAt: now
+      ...(caption ? { caption } : {}),
+      createdAt: nowISO
     };
     const flowHash = await storeFlowObject(flowObj);
 
     await prisma.flow.create({
-      data: {
-        type: "IMAGE",
-        walrusHash: flowHash,
-        imageHash,
-        mime: req.file.mimetype,
-        createdAt: new Date()
-      }
+      data: { type: "IMAGE", walrusHash: flowHash, imageHash, mime: req.file.mimetype, createdAt: new Date() }
     });
 
-    return res.status(201).json({ ok: true, hash: flowHash, type: "IMAGE", imageHash });
+    const tx = await log_action(ActionType.FLOW, flowHash);
+    return res.status(201).json({ ok: true, hash: flowHash, type: "IMAGE", imageHash, tx });
   } catch (err) {
     next(err);
   }
 });
 
-/**
- * GET /flows?limit=20&cursor=ISO
- * Returns chronological feed (newest first).
- * Hydrates content from Walrus so client can render.
- */
+/** GET /flows?limit=20&cursor=ISO — newest first, hydrated from Walrus */
 app.get("/flows", async (req, res, next) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 20, 50);
@@ -103,25 +139,24 @@ app.get("/flows", async (req, res, next) => {
   }
 });
 
-/**
- * POST /glows
- * Body: { flowHash, actorId? }
- * - Stores an action log object in Walrus
- * - Emits blockchain stub log_action
- */
+/* --------------------------- GLOWS & PROMOTES ---------------------------- */
 app.post("/glows", async (req, res, next) => {
   try {
     const { flowHash, actorId } = postGlowSchema.parse(req.body);
-    // verify the flow exists
     const flow = await prisma.flow.findUnique({ where: { walrusHash: flowHash } });
     if (!flow) return res.status(404).json({ ok: false, error: "Flow not found" });
 
-    const actionObj: ActionObject = { kind: "action", action: "GLOW", flowHash, actorId, createdAt: new Date().toISOString() };
+    const actionObj: ActionObject = {
+      kind: "action",
+      action: ActionType.GLOW,
+      flowHash,
+      actorId,
+      createdAt: new Date().toISOString()
+    };
     const actionHash = await storeActionObject(actionObj);
 
     await prisma.glow.create({ data: { walrusHash: actionHash, flowHash, actorId, createdAt: new Date() } });
-
-    const tx = await log_action("GLOW", actionHash, actorId);
+    const tx = await log_action(ActionType.GLOW, actionHash, actorId);
 
     res.status(201).json({ ok: true, hash: actionHash, tx });
   } catch (err) {
@@ -129,12 +164,6 @@ app.post("/glows", async (req, res, next) => {
   }
 });
 
-/**
- * POST /promotes
- * Body: { flowHash, actorId? }
- * - Stores an action log in Walrus with visibilityBoost=10
- * - Emits blockchain stub log_action
- */
 app.post("/promotes", async (req, res, next) => {
   try {
     const { flowHash, actorId } = postPromoteSchema.parse(req.body);
@@ -143,7 +172,7 @@ app.post("/promotes", async (req, res, next) => {
 
     const actionObj: ActionObject = {
       kind: "action",
-      action: "PROMOTE",
+      action: ActionType.PROMOTE,
       flowHash,
       actorId,
       visibilityBoost: 10,
@@ -154,8 +183,7 @@ app.post("/promotes", async (req, res, next) => {
     await prisma.promote.create({
       data: { walrusHash: actionHash, flowHash, actorId, visibilityBoost: 10, createdAt: new Date() }
     });
-
-    const tx = await log_action("PROMOTE", actionHash, actorId);
+    const tx = await log_action(ActionType.PROMOTE, actionHash, actorId);
 
     res.status(201).json({ ok: true, hash: actionHash, tx });
   } catch (err) {
@@ -163,20 +191,21 @@ app.post("/promotes", async (req, res, next) => {
   }
 });
 
-/**
- * OPTIONAL
- * POST /rooms  Body: { type:"room", name }
- * POST /circles Body: { type:"circle", name }
- * POST /join    Body: { groupId, memberId }
- */
+/* ------------------------------ GROUPS API ------------------------------- */
 app.post("/rooms", async (req, res, next) => {
   try {
     const { type, name } = postGroupSchema.parse({ ...req.body, type: "room" });
+    // Walrus: store group metadata
+    const gMeta: GroupMetaObject = { kind: "groupMeta", type, name, createdAt: new Date().toISOString() };
+    const metaHash = await storeGroupMeta(gMeta);
+
     const created = await create_group(type, name);
     const row = await prisma.group.create({
       data: { groupId: created.chainGroupId, type, name }
     });
-    res.status(201).json({ ok: true, group: row, tx: created.tx });
+
+    // Optionally: store metaHash in DB if you add a column later
+    res.status(201).json({ ok: true, group: row, metaHash, tx: created.tx });
   } catch (err) {
     next(err);
   }
@@ -185,11 +214,15 @@ app.post("/rooms", async (req, res, next) => {
 app.post("/circles", async (req, res, next) => {
   try {
     const { type, name } = postGroupSchema.parse({ ...req.body, type: "circle" });
+    const gMeta: GroupMetaObject = { kind: "groupMeta", type, name, createdAt: new Date().toISOString() };
+    const metaHash = await storeGroupMeta(gMeta);
+
     const created = await create_group(type, name);
     const row = await prisma.group.create({
       data: { groupId: created.chainGroupId, type, name }
     });
-    res.status(201).json({ ok: true, group: row, tx: created.tx });
+
+    res.status(201).json({ ok: true, group: row, metaHash, tx: created.tx });
   } catch (err) {
     next(err);
   }
@@ -209,17 +242,49 @@ app.post("/join", async (req, res, next) => {
   }
 });
 
-/** Health */
-app.get("/health", (_, res) => res.json({ ok: true }));
+/* --------------------------------- CHAT ---------------------------------- */
+app.post("/chat", async (req, res, next) => {
+  try {
+    const { text, groupId, actorId } = postChatSchema.parse(req.body);
+    assertNoExternalLinks(text);
 
-/** Error handler */
-app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const chatObj: ChatObject = { kind: "chat", text, groupId, actorId, createdAt: new Date().toISOString() };
+    const chatHash = await storeChatObject(chatObj);
+
+    // index minimally if you have a Chat table; otherwise skip DB
+    // await prisma.chat.create({ data: { walrusHash: chatHash, groupId, actorId } });
+
+    const tx = await log_action(ActionType.CHAT, chatHash, actorId);
+    res.status(201).json({ ok: true, hash: chatHash, tx });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* ------------------------------ VERIFY HASH ------------------------------ */
+app.get("/verify", async (req, res, next) => {
+  try {
+    const hash = (req.query.hash ?? "").toString();
+    if (!hash) return res.status(400).json({ ok: false, error: "hash is required" });
+
+    const result = await verify_action(hash as WalrusHash);
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/* --------------------------------- MISC ---------------------------------- */
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+app.use((err: any, _req: express.Request, res: express.Response) => {
   console.error(err);
-  const code = (err && err.status) || 500;
-  res.status(code).json({ ok: false, error: err?.message ?? "Internal error" });
+  res.status((err && err.status) || 500).json({ ok: false, error: err?.message ?? "Internal error" });
 });
 
 const PORT = Number(process.env.PORT || 4000);
 app.listen(PORT, () => {
-  console.log(`Social Hub API listening on :${PORT} (Walrus=${process.env.WALRUS_MODE}, Chain=${process.env.CHAIN_MODE})`);
+  console.log(
+    `Social Hub API :${PORT} — Walrus=${process.env.WALRUS_MODE}  Chain=${process.env.CHAIN_MODE}`
+  );
 });

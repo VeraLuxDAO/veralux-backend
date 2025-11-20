@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import multer from "multer";
+import swaggerUi from "swagger-ui-express";
 import { PrismaClient } from "@prisma/client";
 import {
   assertNoExternalLinks,
@@ -23,6 +24,7 @@ import {
 import { create_group, join_group, log_action, onChainEvent, verify_action } from "./blockchain.js";
 import type { ActionObject, ChatObject, FlowObject, GroupMetaObject, WalrusHash } from "./types.js";
 import { ActionType } from "./types.js";
+import { swaggerSpec } from "./swagger.js";
 
 const prisma = new PrismaClient();
 const app = express();
@@ -31,11 +33,37 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
+/* ------------------------------ SWAGGER UI ------------------------------- */
+app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
+  customSiteTitle: "YNX Backend API",
+  customCss: ".swagger-ui .topbar { display: none }",
+}));
+
 /* ------------------------------ SSE: /events ------------------------------ */
 type SSEClient = { id: number; res: express.Response };
 const clients = new Map<number, SSEClient>();
 let nextClientId = 1;
 
+/**
+ * @swagger
+ * /events:
+ *   get:
+ *     tags: [Events]
+ *     summary: Server-Sent Events stream
+ *     description: Subscribe to real-time blockchain events (ActionLogged, GroupCreated, GroupAction)
+ *     responses:
+ *       200:
+ *         description: Event stream connection established
+ *         content:
+ *           text/event-stream:
+ *             schema:
+ *               type: string
+ *               example: |
+ *                 event: ping
+ *                 data: {}
+ *
+ *                 data: {"type":"ActionLogged","action":"FLOW","walrusHash":"0a17dcff...","at":"2025-11-20T..."}
+ */
 app.get("/events", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -61,9 +89,35 @@ onChainEvent((e) => broadcast(e)); // tie chain events to SSE
 
 /* -------------------------------- FLOWS ---------------------------------- */
 /**
- * POST /flows
- * - JSON {text} OR multipart("image") + optional caption
- * - Stores in Walrus; logs FLOW to chain; indexes minimal metadata
+ * @swagger
+ * /flows:
+ *   post:
+ *     tags: [Flows]
+ *     summary: Create a new flow (text or image)
+ *     description: |
+ *       Post content as a flow. Supports both text (JSON) and image (multipart/form-data).
+ *       Content is stored in Walrus and logged on the blockchain.
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/FlowTextRequest'
+ *         multipart/form-data:
+ *           schema:
+ *             $ref: '#/components/schemas/FlowImageRequest'
+ *     responses:
+ *       201:
+ *         description: Flow created successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/FlowResponse'
+ *       400:
+ *         description: Invalid request or external links not allowed
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post("/flows", upload.single("image"), async (req, res, next) => {
   try {
@@ -113,7 +167,45 @@ app.post("/flows", upload.single("image"), async (req, res, next) => {
   }
 });
 
-/** GET /flows?limit=20&cursor=ISO — newest first, hydrated from Walrus */
+/**
+ * @swagger
+ * /flows:
+ *   get:
+ *     tags: [Flows]
+ *     summary: List flows with pagination
+ *     description: Get paginated list of flows (newest first), hydrated from Walrus
+ *     parameters:
+ *       - name: limit
+ *         in: query
+ *         schema:
+ *           type: integer
+ *           default: 20
+ *           maximum: 50
+ *         description: Maximum number of flows to return
+ *       - name: cursor
+ *         in: query
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: ISO datetime cursor for pagination
+ *     responses:
+ *       200:
+ *         description: List of flows retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 items:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                 nextCursor:
+ *                   type: string
+ *                   nullable: true
+ */
 app.get("/flows", async (req, res, next) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 20, 50);
@@ -140,6 +232,40 @@ app.get("/flows", async (req, res, next) => {
 });
 
 /* --------------------------- GLOWS & PROMOTES ---------------------------- */
+/**
+ * @swagger
+ * /glows:
+ *   post:
+ *     tags: [Social]
+ *     summary: Glow (like) a flow
+ *     description: Register a glow action for a flow (similar to a "like")
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/GlowRequest'
+ *     responses:
+ *       201:
+ *         description: Glow created successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 hash:
+ *                   type: string
+ *                 tx:
+ *                   $ref: '#/components/schemas/ChainTx'
+ *       404:
+ *         description: Flow not found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post("/glows", async (req, res, next) => {
   try {
     const { flowHash, actorId } = postGlowSchema.parse(req.body);
@@ -164,6 +290,40 @@ app.post("/glows", async (req, res, next) => {
   }
 });
 
+/**
+ * @swagger
+ * /promotes:
+ *   post:
+ *     tags: [Social]
+ *     summary: Promote a flow
+ *     description: Boost visibility of a flow (+10 visibility points)
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/PromoteRequest'
+ *     responses:
+ *       201:
+ *         description: Promote created successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 hash:
+ *                   type: string
+ *                 tx:
+ *                   $ref: '#/components/schemas/ChainTx'
+ *       404:
+ *         description: Flow not found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post("/promotes", async (req, res, next) => {
   try {
     const { flowHash, actorId } = postPromoteSchema.parse(req.body);
@@ -192,6 +352,36 @@ app.post("/promotes", async (req, res, next) => {
 });
 
 /* ------------------------------ GROUPS API ------------------------------- */
+/**
+ * @swagger
+ * /rooms:
+ *   post:
+ *     tags: [Groups]
+ *     summary: Create a new room
+ *     description: Create a public room group on the blockchain
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/GroupRequest'
+ *     responses:
+ *       201:
+ *         description: Room created successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 group:
+ *                   type: object
+ *                 metaHash:
+ *                   type: string
+ *                 tx:
+ *                   $ref: '#/components/schemas/ChainTx'
+ */
 app.post("/rooms", async (req, res, next) => {
   try {
     const { type, name } = postGroupSchema.parse({ ...req.body, type: "room" });
@@ -211,6 +401,36 @@ app.post("/rooms", async (req, res, next) => {
   }
 });
 
+/**
+ * @swagger
+ * /circles:
+ *   post:
+ *     tags: [Groups]
+ *     summary: Create a new circle
+ *     description: Create a private circle group on the blockchain
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/GroupRequest'
+ *     responses:
+ *       201:
+ *         description: Circle created successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 group:
+ *                   type: object
+ *                 metaHash:
+ *                   type: string
+ *                 tx:
+ *                   $ref: '#/components/schemas/ChainTx'
+ */
 app.post("/circles", async (req, res, next) => {
   try {
     const { type, name } = postGroupSchema.parse({ ...req.body, type: "circle" });
@@ -228,6 +448,40 @@ app.post("/circles", async (req, res, next) => {
   }
 });
 
+/**
+ * @swagger
+ * /join:
+ *   post:
+ *     tags: [Groups]
+ *     summary: Join a group
+ *     description: Add a member to a room or circle
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/JoinRequest'
+ *     responses:
+ *       201:
+ *         description: Successfully joined group
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 membership:
+ *                   type: object
+ *                 tx:
+ *                   $ref: '#/components/schemas/ChainTx'
+ *       404:
+ *         description: Group not found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post("/join", async (req, res, next) => {
   try {
     const { groupId, memberId } = postJoinSchema.parse(req.body);
@@ -243,6 +497,63 @@ app.post("/join", async (req, res, next) => {
 });
 
 /* --------------------------------- CHAT ---------------------------------- */
+/**
+ * @swagger
+ * /chat:
+ *   post:
+ *     tags: [Chat]
+ *     summary: Send a chat message 💬
+ *     description: |
+ *       **YES! This backend supports chat messaging!**
+ *       
+ *       Send messages to groups (rooms/circles) or general chat.
+ *       Messages are stored in Walrus (content-addressed storage) and logged on the blockchain.
+ *       Real-time events are broadcast via the /events SSE endpoint.
+ *       
+ *       Features:
+ *       - Group-based messaging
+ *       - Actor/user attribution
+ *       - Immutable storage in Walrus
+ *       - On-chain verification via Sui
+ *       - Real-time SSE notifications
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/ChatRequest'
+ *           examples:
+ *             groupMessage:
+ *               summary: Message to a group
+ *               value:
+ *                 text: "Hello everyone! 👋"
+ *                 groupId: "grp_room_123"
+ *                 actorId: "user456"
+ *             generalMessage:
+ *               summary: General message (no group)
+ *               value:
+ *                 text: "Hello world!"
+ *                 actorId: "user789"
+ *     responses:
+ *       201:
+ *         description: Chat message sent successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ChatResponse'
+ *             example:
+ *               ok: true
+ *               hash: "e986f1b088e7bf1a4fc3add93f71c5fe..."
+ *               tx:
+ *                 txId: "8xKpT9..."
+ *                 network: "sui"
+ *       400:
+ *         description: Invalid request or external links not allowed
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.post("/chat", async (req, res, next) => {
   try {
     const { text, groupId, actorId } = postChatSchema.parse(req.body);
@@ -262,6 +573,48 @@ app.post("/chat", async (req, res, next) => {
 });
 
 /* ------------------------------ VERIFY HASH ------------------------------ */
+/**
+ * @swagger
+ * /verify:
+ *   get:
+ *     tags: [Verification]
+ *     summary: Verify action hash on blockchain
+ *     description: Check if a Walrus hash has been logged on-chain (implementation depends on CHAIN_MODE)
+ *     parameters:
+ *       - name: hash
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Walrus hash to verify
+ *         example: "0a17dcffcd3e1d9e6e12a81b2ba57003810a114a26b4e836733083f3460a7d3f"
+ *     responses:
+ *       200:
+ *         description: Verification result
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 valid:
+ *                   type: boolean
+ *                   description: Whether the hash is verified on-chain
+ *                 network:
+ *                   type: string
+ *                   enum: [stub, sui, evm]
+ *             example:
+ *               ok: true
+ *               valid: true
+ *               network: "sui"
+ *       400:
+ *         description: Hash parameter required
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
 app.get("/verify", async (req, res, next) => {
   try {
     const hash = (req.query.hash ?? "").toString();
@@ -275,6 +628,23 @@ app.get("/verify", async (req, res, next) => {
 });
 
 /* --------------------------------- MISC ---------------------------------- */
+/**
+ * @swagger
+ * /health:
+ *   get:
+ *     tags: [Health]
+ *     summary: Health check endpoint
+ *     description: Simple liveness check for the API
+ *     responses:
+ *       200:
+ *         description: API is healthy
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/SuccessResponse'
+ *             example:
+ *               ok: true
+ */
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.use((err: any, _req: express.Request, res: express.Response) => {

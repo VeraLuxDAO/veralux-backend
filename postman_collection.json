@@ -1,0 +1,158 @@
+{
+  "info": {
+    "name": "YNX-backend API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "version": "1.0.0",
+    "description": "Collection for the YNX-backend (Social Hub) API. Set `baseUrl` environment variable (e.g. http://localhost:4000)."
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:4000" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "{{baseUrl}}/health" }
+      },
+      "response": []
+    },
+    {
+      "name": "SSE Events (Event Stream)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "{{baseUrl}}/events" },
+        "description": "Server-Sent Events endpoint. Use a browser or a client that supports SSE to listen for chain events (ActionLogged, GroupCreated, GroupAction)."
+      }
+    },
+    {
+      "name": "Create Flow (TEXT) — JSON",
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" } ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"text\": \"Hello from Postman\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": { "raw": "{{baseUrl}}/flows" }
+      }
+    },
+    {
+      "name": "Create Flow (IMAGE) — multipart/form-data",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            { "key": "image", "type": "file", "src": [] },
+            { "key": "caption", "value": "An example image", "type": "text" }
+          ]
+        },
+        "url": { "raw": "{{baseUrl}}/flows" },
+        "description": "Use Postman form-data; set a file for the `image` key."
+      }
+    },
+    {
+      "name": "List Flows",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "{{baseUrl}}/flows?limit=20" },
+        "description": "Query params: `limit` (max 50) and `cursor` (ISO date string for pagination)."
+      }
+    },
+    {
+      "name": "Post Glow",
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" } ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"flowHash\": \"<walrus-flow-hash>\",\n  \"actorId\": \"actor1\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": { "raw": "{{baseUrl}}/glows" }
+      }
+    },
+    {
+      "name": "Post Promote",
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" } ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"flowHash\": \"<walrus-flow-hash>\",\n  \"actorId\": \"actor1\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": { "raw": "{{baseUrl}}/promotes" }
+      }
+    },
+    {
+      "name": "Create Room",
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" } ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"General Room\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": { "raw": "{{baseUrl}}/rooms" },
+        "description": "Server assigns type=\"room\" automatically before validation."
+      }
+    },
+    {
+      "name": "Create Circle",
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" } ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"My Circle\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": { "raw": "{{baseUrl}}/circles" },
+        "description": "Server assigns type=\"circle\" automatically before validation."
+      }
+    },
+    {
+      "name": "Join Group",
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" } ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"groupId\": \"grp_room_<id>\",\n  \"memberId\": \"member123\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": { "raw": "{{baseUrl}}/join" }
+      }
+    },
+    {
+      "name": "Post Chat",
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" } ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"text\": \"Hello group!\",\n  \"groupId\": \"grp_room_<id>\",\n  \"actorId\": \"actor1\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": { "raw": "{{baseUrl}}/chat" }
+      }
+    },
+    {
+      "name": "Verify Hash",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "{{baseUrl}}/verify?hash=<walrus-or-action-hash>" },
+        "description": "Checks whether an action hash was logged on-chain (stub mode checks in-memory ledger)."
+      }
+    }
+  ]
+}

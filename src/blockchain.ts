@@ -5,8 +5,11 @@ import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import { Transaction } from "@mysten/sui/transactions";
 import { fromBase64 } from "@mysten/sui/utils";
 import type { ActionType, GroupType, WalrusHash } from "./types.js";
+import { walrus } from "./walrus.js";
+import { createLogger } from "./logger.js";
 
-const MODE = process.env.CHAIN_MODE ?? "stub"; // stub | evm | sui
+const logger = createLogger("blockchain");
+const MODE = process.env.CHAIN_MODE ?? "stub"; // stub | evm | sui | walrus
 
 /** Sui client setup (lazy initialization) */
 let suiClient: SuiClient | null = null;
@@ -58,8 +61,22 @@ export type ChainEvent =
 
 const bus = new EventEmitter();
 
-// Simple in-memory ledger of hashes "logged" on chain (stub mode)
+// Simple in-memory ledger of hashes "logged" (stub or walrus mode)
 const loggedWalrusHashes = new Set<string>();
+
+// Walrus action log chain state (only used when MODE === "walrus")
+let walrusLogHead: WalrusHash | null = null;
+let walrusLogSeq = 0;
+
+type WalrusActionLogEntry = {
+  kind: "actionLog";
+  seq: number;
+  at: string;
+  action: ActionType;
+  walrusHash: WalrusHash;
+  actorId?: string;
+  prev?: WalrusHash | null;
+};
 
 export type ChainTx = { txId: string; network: "stub" | "evm" | "sui" };
 
@@ -78,10 +95,33 @@ export async function log_action(
   walrusHash: WalrusHash,
   actorId?: string
 ): Promise<ChainTx> {
+  logger.debug("log_action start", { mode: MODE, action, walrusHash, actorId });
+  
   if (MODE === "stub") {
     loggedWalrusHashes.add(walrusHash);
     emitEvent({ type: "ActionLogged", action, walrusHash, actorId, at: new Date().toISOString() });
-    return { txId: `stub-${randomUUID()}`, network: "stub" };
+    const txId = `stub-${randomUUID()}`;
+    logger.info("log_action (stub) complete", { txId, action });
+    return { txId, network: "stub" };
+  }
+
+  if (MODE === "walrus") {
+    const at = new Date().toISOString();
+    const entry: WalrusActionLogEntry = {
+      kind: "actionLog",
+      seq: walrusLogSeq++,
+      at,
+      action,
+      walrusHash,
+      actorId,
+      prev: walrusLogHead,
+    };
+    const entryHash = await walrus.putJson(entry);
+    walrusLogHead = entryHash;
+    loggedWalrusHashes.add(walrusHash);
+    emitEvent({ type: "ActionLogged", action, walrusHash, actorId, at });
+    logger.info("log_action (walrus) complete", { txId: entryHash, action, seq: entry.seq });
+    return { txId: entryHash, network: "stub" }; // treat as stub network for now
   }
 
   if (MODE === "sui") {
@@ -90,6 +130,7 @@ export async function log_action(
     const packageId = getSuiPackageId();
     const moduleName = process.env.SUI_ACTION_MODULE ?? "action_log";
 
+    logger.debug("log_action (sui) calling contract", { packageId, moduleName });
     const tx = new Transaction();
     
     // Call: package_id::action_log::log_action(action_type: u8, walrus_hash: vector<u8>, actor_id: vector<u8>)
@@ -109,11 +150,13 @@ export async function log_action(
     });
 
     if (result.effects?.status?.status !== "success") {
+      logger.error("log_action (sui) failed", { error: result.effects?.status?.error });
       throw new Error(`Sui transaction failed: ${result.effects?.status?.error}`);
     }
 
     loggedWalrusHashes.add(walrusHash);
     emitEvent({ type: "ActionLogged", action, walrusHash, actorId, at: new Date().toISOString() });
+    logger.info("log_action (sui) complete", { txId: result.digest, action });
     
     return { txId: result.digest, network: "sui" };
   }
@@ -144,9 +187,12 @@ export async function create_group(
   type: GroupType,
   name: string
 ): Promise<{ chainGroupId: string; tx: ChainTx }> {
+  logger.debug("create_group start", { mode: MODE, type, name });
+  
   if (MODE === "stub") {
     const id = `grp_${type}_${randomUUID()}`;
     emitEvent({ type: "GroupCreated", groupId: id, groupType: type, name, at: new Date().toISOString() });
+    logger.info("create_group (stub) complete", { groupId: id, type });
     return { chainGroupId: id, tx: { txId: `stub-${randomUUID()}`, network: "stub" } };
   }
 
@@ -176,6 +222,7 @@ export async function create_group(
     });
 
     if (result.effects?.status?.status !== "success") {
+      logger.error("create_group (sui) failed", { error: result.effects?.status?.error });
       throw new Error(`Sui create_group failed: ${result.effects?.status?.error}`);
     }
 
@@ -190,6 +237,7 @@ export async function create_group(
 
     const groupId = created.objectId;
     emitEvent({ type: "GroupCreated", groupId, groupType: type, name, at: new Date().toISOString() });
+    logger.info("create_group (sui) complete", { groupId, txId: result.digest, type });
     
     return { chainGroupId: groupId, tx: { txId: result.digest, network: "sui" } };
   }
@@ -198,9 +246,13 @@ export async function create_group(
 }
 
 export async function join_group(groupId: string, memberId: string): Promise<ChainTx> {
+  logger.debug("join_group start", { mode: MODE, groupId, memberId });
+  
   if (MODE === "stub") {
     emitEvent({ type: "GroupAction", groupId, memberId, action: "JOIN", at: new Date().toISOString() });
-    return { txId: `stub-${randomUUID()}`, network: "stub" };
+    const txId = `stub-${randomUUID()}`;
+    logger.info("join_group (stub) complete", { txId, groupId, memberId });
+    return { txId, network: "stub" };
   }
 
   if (MODE === "sui") {
@@ -209,6 +261,7 @@ export async function join_group(groupId: string, memberId: string): Promise<Cha
     const packageId = getSuiPackageId();
     const moduleName = process.env.SUI_GROUP_MODULE ?? "groups";
 
+    logger.debug("join_group (sui) calling contract", { packageId, moduleName, groupId });
     const tx = new Transaction();
     
     // Call: package_id::groups::join_group(group: &mut Group, member_id: vector<u8>)
@@ -227,10 +280,12 @@ export async function join_group(groupId: string, memberId: string): Promise<Cha
     });
 
     if (result.effects?.status?.status !== "success") {
+      logger.error("join_group (sui) failed", { error: result.effects?.status?.error, groupId, memberId });
       throw new Error(`Sui join_group failed: ${result.effects?.status?.error}`);
     }
 
     emitEvent({ type: "GroupAction", groupId, memberId, action: "JOIN", at: new Date().toISOString() });
+    logger.info("join_group (sui) complete", { txId: result.digest, groupId, memberId });
     
     return { txId: result.digest, network: "sui" };
   }
@@ -240,14 +295,43 @@ export async function join_group(groupId: string, memberId: string): Promise<Cha
 
 /** VERIFICATION */
 export async function verify_action(hash: WalrusHash): Promise<{ valid: boolean; network: ChainTx["network"] }> {
+  logger.debug("verify_action start", { mode: MODE, hash });
+  
   if (MODE === "stub") {
-    return { valid: loggedWalrusHashes.has(hash), network: "stub" };
+    const valid = loggedWalrusHashes.has(hash);
+    logger.info("verify_action (stub) complete", { hash, valid });
+    return { valid, network: "stub" };
+  }
+
+  if (MODE === "walrus") {
+    // Walk the walrus action log chain starting from head until we either find the hash or exhaust
+    logger.debug("verify_action (walrus) walking chain", { head: walrusLogHead });
+    let current = walrusLogHead;
+    const visited = new Set<string>();
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      try {
+        const entry = await walrus.getJson<WalrusActionLogEntry>(current);
+        if (entry.walrusHash === hash) {
+          logger.info("verify_action (walrus) found", { hash, entryHash: current });
+          return { valid: true, network: "stub" };
+        }
+        current = entry.prev || null;
+      } catch (err) {
+        logger.warn("verify_action (walrus) chain read error", { current, error: err instanceof Error ? err.message : String(err) });
+        break; // corrupted chain segment; treat as not found
+      }
+    }
+    logger.info("verify_action (walrus) not found", { hash, chainLength: visited.size });
+    return { valid: false, network: "stub" };
   }
 
   if (MODE === "sui") {
     const client = getSuiClient();
     const packageId = getSuiPackageId();
     const moduleName = process.env.SUI_ACTION_MODULE ?? "action_log";
+    
+    logger.debug("verify_action (sui) querying events", { packageId, moduleName });
     
     // Query events emitted by log_action for this hash
     // Event structure: package_id::action_log::ActionLogged { walrus_hash: vector<u8>, ... }
@@ -264,13 +348,15 @@ export async function verify_action(hash: WalrusHash): Promise<{ valid: boolean;
       for (const event of events.data) {
         const eventData = event.parsedJson as any;
         if (eventData?.walrus_hash === hash) {
+          logger.info("verify_action (sui) found", { hash });
           return { valid: true, network: "sui" };
         }
       }
 
+      logger.info("verify_action (sui) not found", { hash, eventsChecked: events.data.length });
       return { valid: false, network: "sui" };
     } catch (error) {
-      console.error("Error verifying action on Sui:", error);
+      logger.error("verify_action (sui) error", { hash, error: error instanceof Error ? error.message : String(error) });
       return { valid: false, network: "sui" };
     }
   }

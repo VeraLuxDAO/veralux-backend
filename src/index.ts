@@ -4,6 +4,7 @@ import cors from "cors";
 import multer from "multer";
 import swaggerUi from "swagger-ui-express";
 import { PrismaClient } from "@prisma/client";
+import { createLogger } from "./logger.js";
 import {
   assertNoExternalLinks,
   postChatSchema,
@@ -26,11 +27,39 @@ import type { ActionObject, ChatObject, FlowObject, GroupMetaObject, WalrusHash 
 import { ActionType } from "./types.js";
 import { swaggerSpec } from "./swagger.js";
 
+const logger = createLogger("api");
+logger.info("Initializing Prisma client");
 const prisma = new PrismaClient();
+
+// Test database connection
+prisma.$connect()
+  .then(() => logger.info("Database connected successfully"))
+  .catch((err) => {
+    logger.error("Database connection failed", { error: err.message });
+    process.exit(1);
+  });
+
+// Catch unhandled errors
+process.on("unhandledRejection", (reason, promise) => {
+  logger.error("Unhandled Promise Rejection", { reason: String(reason), promise: String(promise) });
+  console.error("Unhandled Rejection:", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  logger.error("Uncaught Exception", { error: error.message, stack: error.stack });
+  console.error("Uncaught Exception:", error);
+  process.exit(1);
+});
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
 
-app.use(cors());
+// CORS configuration - allow all origins for development
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false
+}));
 app.use(express.json({ limit: "2mb" }));
 
 /* ------------------------------ SWAGGER UI ------------------------------- */
@@ -68,9 +97,13 @@ app.get("/events", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.flushHeaders?.();
   const id = nextClientId++;
   clients.set(id, { id, res });
+  logger.info("SSE client connected", { clientId: id, totalClients: clients.size });
 
   // Heartbeat
   const iv = setInterval(() => res.write(`event: ping\ndata: {}\n\n`), 15000);
@@ -78,6 +111,7 @@ app.get("/events", (req, res) => {
   req.on("close", () => {
     clearInterval(iv);
     clients.delete(id);
+    logger.info("SSE client disconnected", { clientId: id, totalClients: clients.size });
   });
 });
 
@@ -124,28 +158,43 @@ app.post("/flows", upload.single("image"), async (req, res, next) => {
     const nowISO = new Date().toISOString();
 
     if (req.is("application/json")) {
+      logger.info("POST /flows (text)", { textLength: req.body.text?.length });
       const parsed = postFlowTextSchema.parse(req.body);
       assertNoExternalLinks(parsed.text);
 
       const flowObj: FlowObject = { kind: "flow", type: "TEXT", text: parsed.text, createdAt: nowISO };
       const flowHash = await storeFlowObject(flowObj);
+      logger.debug("Text flow stored", { flowHash });
 
       await prisma.flow.create({
         data: { type: "TEXT", walrusHash: flowHash, createdAt: new Date() }
       });
+      logger.debug("Text flow saved to DB");
 
       const tx = await log_action(ActionType.FLOW, flowHash);
+      logger.info("Text flow created", { flowHash, tx: tx.txId });
       return res.status(201).json({ ok: true, hash: flowHash, type: "TEXT", tx });
     }
 
     // multipart: image
     if (!req.file) {
+      logger.warn("POST /flows missing file");
       return res.status(400).json({ ok: false, error: "Provide JSON {text} or multipart with 'image'." });
     }
+    logger.info("POST /flows (image)", { 
+      size: req.file.size, 
+      mime: req.file.mimetype, 
+      originalname: req.file.originalname 
+    });
     const caption = (req.body?.caption ?? "").toString();
     assertNoExternalLinks(caption);
 
-    const imageHash = await walrus.putRaw(req.file.buffer);
+    const imageHash = await walrus.putRaw(req.file.buffer, {
+      identifier: req.file.originalname,
+      mime: req.file.mimetype,
+    });
+    logger.debug("Image uploaded to Walrus", { imageHash });
+    
     const flowObj: FlowObject = {
       kind: "flow",
       type: "IMAGE",
@@ -155,14 +204,18 @@ app.post("/flows", upload.single("image"), async (req, res, next) => {
       createdAt: nowISO
     };
     const flowHash = await storeFlowObject(flowObj);
+    logger.debug("Image flow metadata stored", { flowHash });
 
     await prisma.flow.create({
       data: { type: "IMAGE", walrusHash: flowHash, imageHash, mime: req.file.mimetype, createdAt: new Date() }
     });
+    logger.debug("Image flow saved to DB");
 
     const tx = await log_action(ActionType.FLOW, flowHash);
+    logger.info("Image flow created", { flowHash, imageHash, tx: tx.txId });
     return res.status(201).json({ ok: true, hash: flowHash, type: "IMAGE", imageHash, tx });
   } catch (err) {
+    logger.error("POST /flows failed", err);
     next(err);
   }
 });
@@ -645,15 +698,29 @@ app.get("/verify", async (req, res, next) => {
  *             example:
  *               ok: true
  */
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (_req, res) => {
+  logger.debug("GET /health");
+  res.json({ ok: true });
+});
 
-app.use((err: any, _req: express.Request, res: express.Response) => {
-  console.error(err);
+app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  logger.error("Request error", { 
+    method: req.method, 
+    path: req.path, 
+    error: err?.message,
+    stack: err?.stack 
+  });
   res.status((err && err.status) || 500).json({ ok: false, error: err?.message ?? "Internal error" });
 });
 
 const PORT = Number(process.env.PORT || 4000);
 app.listen(PORT, () => {
+  logger.info("Server started", {
+    port: PORT,
+    walrusMode: process.env.WALRUS_MODE,
+    chainMode: process.env.CHAIN_MODE,
+    logLevel: process.env.LOG_LEVEL || "info"
+  });
   console.log(
     `Social Hub API :${PORT} — Walrus=${process.env.WALRUS_MODE}  Chain=${process.env.CHAIN_MODE}`
   );

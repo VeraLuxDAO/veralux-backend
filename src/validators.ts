@@ -44,12 +44,12 @@ export const postFlowTextSchema = z.object({
 });
 
 export const postGlowSchema = z.object({
-  flowHash: z.string().min(10),
+  flowPatchId: z.string().min(10),
   actorId: z.string().optional()
 });
 
 export const postPromoteSchema = z.object({
-  flowHash: z.string().min(10),
+  flowPatchId: z.string().min(10),
   actorId: z.string().optional()
 });
 

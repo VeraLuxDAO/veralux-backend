@@ -1,4 +1,5 @@
-export type WalrusHash = string;
+export type WalrusPatchId = string;
+export type WalrusHash = WalrusPatchId; // temporary alias until blockchain module renamed
 
 export type GroupType = "room" | "circle";
 
@@ -22,7 +23,7 @@ export type FlowObject =
   | {
       kind: "flow";
       type: "IMAGE";
-      imageHash: WalrusHash;
+      imagePatchId: string;
       mime: string;
       caption?: string;
       createdAt: string;
@@ -46,8 +47,8 @@ export type GroupMetaObject = {
 export type ActionObject = {
   kind: "action";
   action: ActionType;
-  walrusRef?: WalrusHash;        // generally points to another Walrus object
-  flowHash?: WalrusHash;         // used by GLOW/PROMOTE
+  refPatchId?: string;           // generally points to another Walrus object
+  flowPatchId?: string;          // used by GLOW/PROMOTE
   groupId?: string;              // GROUP_CREATE/GROUP_JOIN/CHAT
   visibilityBoost?: number;      // PROMOTE (+10)
   actorId?: string;

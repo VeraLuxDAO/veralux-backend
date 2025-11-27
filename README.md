@@ -59,6 +59,57 @@ Required env values:
 
 With `CHAIN_MODE=walrus` the action log itself is also persisted in Walrus, so you can verify flows without deploying a dedicated smart contract.
 
+### Reading Stored Blobs Correctly
+
+The Walrus SDK exposes multiple helpers on each `WalrusFile`:
+
+- `file.json()` — ONLY call when you are sure the blob is JSON.
+- `file.text()` — For plain UTF-8 text (no JSON parsing overhead).
+- `file.bytes()` — Raw `Uint8Array` (images / binary).
+
+If you are unsure of the content type, a safe pattern:
+
+```ts
+const [file] = await walrusClient.walrus.getFiles({ ids: [blobId] });
+let data;
+try {
+	data = await file.json();          // attempt JSON first
+} catch {
+	try { data = await file.text(); }  // fallback to text
+	catch { data = await file.bytes(); } // final fallback to bytes
+}
+```
+
+In this backend, the helper `walrusIO.readFlexible(hash)` performs that logic and returns:
+
+```ts
+type FlexibleRead = { kind: 'json' | 'text' | 'binary'; data: any; bytes: Uint8Array };
+```
+
+Usage examples:
+
+```ts
+const flex = await walrusIO.readFlexible(walrusHash);
+if (flex.kind === 'json') {
+	// handle JSON metadata (e.g. IMAGE flow metadata with imageHash, caption)
+} else if (flex.kind === 'text') {
+	// plain text flow
+} else {
+	// binary blob (image, etc.)
+}
+```
+
+IMAGE flows store two hashes:
+
+- `walrusHash` — JSON metadata blob (contains `imageHash`, optional `caption`)
+- `imageHash` — Raw image bytes
+
+Legacy/incorrect records may have `walrusHash` pointing directly to the image. The flexible reader detects that and the `/flows` endpoint falls back gracefully.
+
+### Upload Pipeline (Real Mode Recap)
+
+All writes follow: `encode → register → upload → certify` via `writeFilesFlow`. Certification is required for the blob to become readable by aggregation nodes.
+
 ## API Endpoints
 - `GET /health` - Health check
 - `POST /flows` - Create post (text or image)

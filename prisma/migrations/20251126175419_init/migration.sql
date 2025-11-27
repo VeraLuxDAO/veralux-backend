@@ -5,8 +5,10 @@ CREATE TYPE "public"."FlowType" AS ENUM ('TEXT', 'IMAGE');
 CREATE TABLE "public"."Flow" (
     "id" TEXT NOT NULL,
     "type" "public"."FlowType" NOT NULL,
-    "walrusHash" TEXT NOT NULL,
-    "imageHash" TEXT,
+    "blobId" TEXT NOT NULL,
+    "imageBlobId" TEXT,
+    "patchId" TEXT NOT NULL,
+    "imagePatchId" TEXT,
     "mime" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "authorId" TEXT,
@@ -17,8 +19,9 @@ CREATE TABLE "public"."Flow" (
 -- CreateTable
 CREATE TABLE "public"."Glow" (
     "id" TEXT NOT NULL,
-    "flowHash" TEXT NOT NULL,
-    "walrusHash" TEXT NOT NULL,
+    "flowPatchId" TEXT NOT NULL,
+    "blobId" TEXT NOT NULL,
+    "patchId" TEXT NOT NULL,
     "actorId" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
@@ -28,8 +31,9 @@ CREATE TABLE "public"."Glow" (
 -- CreateTable
 CREATE TABLE "public"."Promote" (
     "id" TEXT NOT NULL,
-    "flowHash" TEXT NOT NULL,
-    "walrusHash" TEXT NOT NULL,
+    "flowPatchId" TEXT NOT NULL,
+    "blobId" TEXT NOT NULL,
+    "patchId" TEXT NOT NULL,
     "visibilityBoost" INTEGER NOT NULL DEFAULT 10,
     "actorId" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -43,6 +47,8 @@ CREATE TABLE "public"."Group" (
     "groupId" TEXT NOT NULL,
     "type" TEXT NOT NULL,
     "name" TEXT NOT NULL,
+    "blobId" TEXT,
+    "patchId" TEXT,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "Group_pkey" PRIMARY KEY ("id")
@@ -59,13 +65,13 @@ CREATE TABLE "public"."Membership" (
 );
 
 -- CreateIndex
-CREATE UNIQUE INDEX "Flow_walrusHash_key" ON "public"."Flow"("walrusHash");
+CREATE UNIQUE INDEX "Flow_patchId_key" ON "public"."Flow"("patchId");
 
 -- CreateIndex
-CREATE INDEX "Glow_flowHash_idx" ON "public"."Glow"("flowHash");
+CREATE INDEX "Glow_flowPatchId_idx" ON "public"."Glow"("flowPatchId");
 
 -- CreateIndex
-CREATE INDEX "Promote_flowHash_idx" ON "public"."Promote"("flowHash");
+CREATE INDEX "Promote_flowPatchId_idx" ON "public"."Promote"("flowPatchId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Group_groupId_key" ON "public"."Group"("groupId");

@@ -5,7 +5,7 @@ import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import { Transaction } from "@mysten/sui/transactions";
 import { fromBase64 } from "@mysten/sui/utils";
 import type { ActionType, GroupType, WalrusHash } from "./types.js";
-import { walrus } from "./walrus.js";
+import { walrusIO } from "./walrus.js";
 import { createLogger } from "./logger.js";
 
 const logger = createLogger("blockchain");
@@ -116,12 +116,12 @@ export async function log_action(
       actorId,
       prev: walrusLogHead,
     };
-    const entryHash = await walrus.putJson(entry);
-    walrusLogHead = entryHash;
+    const { patchId: entryPatchId } = await walrusIO.putJson(entry);
+    walrusLogHead = entryPatchId;
     loggedWalrusHashes.add(walrusHash);
     emitEvent({ type: "ActionLogged", action, walrusHash, actorId, at });
-    logger.info("log_action (walrus) complete", { txId: entryHash, action, seq: entry.seq });
-    return { txId: entryHash, network: "stub" }; // treat as stub network for now
+    logger.info("log_action (walrus) complete", { txId: entryPatchId, action, seq: entry.seq });
+    return { txId: entryPatchId, network: "stub" }; // treat as stub network for now
   }
 
   if (MODE === "sui") {
@@ -311,7 +311,7 @@ export async function verify_action(hash: WalrusHash): Promise<{ valid: boolean;
     while (current && !visited.has(current)) {
       visited.add(current);
       try {
-        const entry = await walrus.getJson<WalrusActionLogEntry>(current);
+        const entry = await walrusIO.getJson<WalrusActionLogEntry>(current);
         if (entry.walrusHash === hash) {
           logger.info("verify_action (walrus) found", { hash, entryHash: current });
           return { valid: true, network: "stub" };

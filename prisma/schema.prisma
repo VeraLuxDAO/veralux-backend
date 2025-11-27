@@ -12,40 +12,57 @@ enum FlowType {
   IMAGE
 }
 
+// Flow = A post (text or image)
+// 
+// HOW TO FETCH DATA:
+// - For TEXT: use patchId with aggregator → {aggregator}/v1/blobs/by-quilt-patch-id/{patchId}
+// - For IMAGE: use imagePatchId with aggregator → {aggregator}/v1/blobs/by-quilt-patch-id/{imagePatchId}
+//
 model Flow {
-  id          String   @id @default(cuid())
-  type        FlowType
-  walrusHash  String   @unique
-  imageHash   String?  // if type=IMAGE, points to raw image blob in Walrus
-  mime        String?
-  createdAt   DateTime @default(now())
-  authorId    String?  // optional user
+  id            String    @id @default(cuid())
+  type          FlowType
+  
+  // === BLOB ID === (the quilt container - for reference only)
+  blobId        String    // Walrus blob ID for flow metadata
+  imageBlobId   String?   // Walrus blob ID for image (only for IMAGE type)
+  
+  // === PATCH ID === (USE THIS TO FETCH DATA!)
+  patchId       String    @unique  // Walrus patch ID for flow metadata JSON
+  imagePatchId  String?   // Walrus patch ID for image file (only for IMAGE type)
+  
+  mime          String?
+  createdAt     DateTime  @default(now())
+  authorId      String?
 }
 
 model Glow {
   id          String   @id @default(cuid())
-  flowHash    String   // references Flow.walrusHash
-  walrusHash  String   // glow log in Walrus (immutable)
+  flowPatchId String   // Flow.patchId that was glowed
+  blobId      String   // Walrus blob ID
+  patchId     String   // Walrus patch ID for glow action
   actorId     String?
   createdAt   DateTime @default(now())
-  @@index([flowHash])
+  @@index([flowPatchId])
 }
 
 model Promote {
   id              String   @id @default(cuid())
-  flowHash        String
-  walrusHash      String
+  flowPatchId     String   // Flow.patchId that was promoted
+  blobId          String   // Walrus blob ID
+  patchId         String   // Walrus patch ID for promote action
   visibilityBoost Int      @default(10)
   actorId         String?
   createdAt       DateTime @default(now())
-  @@index([flowHash])
+  @@index([flowPatchId])
 }
 
 model Group {
-  id         String   @id @default(cuid()) // off-chain id
-  groupId    String   @unique              // on-chain id or stubbed
-  type       String                         // "room" | "circle"
+  id         String   @id @default(cuid())
+  groupId    String   @unique  // on-chain id
+  type       String            // "room" | "circle"
   name       String
+  blobId     String?  // Walrus blob ID for group metadata
+  patchId    String?  // Walrus patch ID for group metadata
   createdAt  DateTime @default(now())
 }
 

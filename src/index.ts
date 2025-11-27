@@ -15,15 +15,14 @@ import {
   postPromoteSchema
 } from "./validators.js";
 import {
-  loadFlowObject,
   storeActionObject,
   storeChatObject,
   storeFlowObject,
   storeGroupMeta,
-  walrus
+  walrusIO
 } from "./walrus.js";
 import { create_group, join_group, log_action, onChainEvent, verify_action } from "./blockchain.js";
-import type { ActionObject, ChatObject, FlowObject, GroupMetaObject, WalrusHash } from "./types.js";
+import type { ActionObject, ChatObject, FlowObject, GroupMetaObject, WalrusPatchId } from "./types.js";
 import { ActionType } from "./types.js";
 import { swaggerSpec } from "./swagger.js";
 
@@ -50,10 +49,11 @@ process.on("uncaughtException", (error) => {
   console.error("Uncaught Exception:", error);
   process.exit(1);
 });
+
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
 
-// CORS configuration - allow all origins for development
+// CORS configuration
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -73,41 +73,16 @@ type SSEClient = { id: number; res: express.Response };
 const clients = new Map<number, SSEClient>();
 let nextClientId = 1;
 
-/**
- * @swagger
- * /events:
- *   get:
- *     tags: [Events]
- *     summary: Server-Sent Events stream
- *     description: Subscribe to real-time blockchain events (ActionLogged, GroupCreated, GroupAction)
- *     responses:
- *       200:
- *         description: Event stream connection established
- *         content:
- *           text/event-stream:
- *             schema:
- *               type: string
- *               example: |
- *                 event: ping
- *                 data: {}
- *
- *                 data: {"type":"ActionLogged","action":"FLOW","walrusHash":"0a17dcff...","at":"2025-11-20T..."}
- */
 app.get("/events", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.flushHeaders?.();
   const id = nextClientId++;
   clients.set(id, { id, res });
   logger.info("SSE client connected", { clientId: id, totalClients: clients.size });
-
-  // Heartbeat
   const iv = setInterval(() => res.write(`event: ping\ndata: {}\n\n`), 15000);
-
   req.on("close", () => {
     clearInterval(iv);
     clients.delete(id);
@@ -119,101 +94,110 @@ function broadcast(e: unknown) {
   const payload = `data: ${JSON.stringify(e)}\n\n`;
   clients.forEach(({ res }) => res.write(payload));
 }
-onChainEvent((e) => broadcast(e)); // tie chain events to SSE
+onChainEvent((e) => broadcast(e));
 
 /* -------------------------------- FLOWS ---------------------------------- */
 /**
- * @swagger
- * /flows:
- *   post:
- *     tags: [Flows]
- *     summary: Create a new flow (text or image)
- *     description: |
- *       Post content as a flow. Supports both text (JSON) and image (multipart/form-data).
- *       Content is stored in Walrus and logged on the blockchain.
- *     requestBody:
- *       content:
- *         application/json:
- *           schema:
- *             $ref: '#/components/schemas/FlowTextRequest'
- *         multipart/form-data:
- *           schema:
- *             $ref: '#/components/schemas/FlowImageRequest'
- *     responses:
- *       201:
- *         description: Flow created successfully
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/FlowResponse'
- *       400:
- *         description: Invalid request or external links not allowed
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
+ * POST /flows - Create a new flow (text or image)
+ * 
+ * Stores in database:
+ * - blobId: Walrus blob ID (the quilt container)
+ * - patchId: Walrus patch ID (USE THIS TO FETCH DATA)
+ * - imageBlobId: Walrus blob ID for image (IMAGE type only)
+ * - imagePatchId: Walrus patch ID for image (USE THIS TO FETCH IMAGE)
  */
 app.post("/flows", upload.single("image"), async (req, res, next) => {
   try {
     const nowISO = new Date().toISOString();
 
+    // TEXT flow
     if (req.is("application/json")) {
       logger.info("POST /flows (text)", { textLength: req.body.text?.length });
       const parsed = postFlowTextSchema.parse(req.body);
       assertNoExternalLinks(parsed.text);
 
       const flowObj: FlowObject = { kind: "flow", type: "TEXT", text: parsed.text, createdAt: nowISO };
-      const flowHash = await storeFlowObject(flowObj);
-      logger.debug("Text flow stored", { flowHash });
+      const { blobId, patchId } = await storeFlowObject(flowObj);
+      
+      logger.info("Text flow stored in Walrus", { blobId, patchId });
 
       await prisma.flow.create({
-        data: { type: "TEXT", walrusHash: flowHash, createdAt: new Date() }
+        data: { 
+          type: "TEXT", 
+          blobId,      // Blob ID (container)
+          patchId,     // Patch ID (USE THIS TO FETCH)
+          createdAt: new Date() 
+        }
       });
-      logger.debug("Text flow saved to DB");
 
-      const tx = await log_action(ActionType.FLOW, flowHash);
-      logger.info("Text flow created", { flowHash, tx: tx.txId });
-      return res.status(201).json({ ok: true, hash: flowHash, type: "TEXT", tx });
+      const tx = await log_action(ActionType.FLOW, patchId);
+      logger.info("Text flow created", { blobId, patchId });
+      
+      return res.status(201).json({ 
+        ok: true, 
+        type: "TEXT",
+        blobId,
+        patchId,
+        tx 
+      });
     }
 
-    // multipart: image
+    // IMAGE flow
     if (!req.file) {
-      logger.warn("POST /flows missing file");
       return res.status(400).json({ ok: false, error: "Provide JSON {text} or multipart with 'image'." });
     }
-    logger.info("POST /flows (image)", { 
-      size: req.file.size, 
-      mime: req.file.mimetype, 
-      originalname: req.file.originalname 
-    });
+    
+    logger.info("POST /flows (image)", { size: req.file.size, mime: req.file.mimetype });
     const caption = (req.body?.caption ?? "").toString();
     assertNoExternalLinks(caption);
 
-    const imageHash = await walrus.putRaw(req.file.buffer, {
+    // 1. Upload image to Walrus
+    const imageUpload = await walrusIO.putRaw(req.file.buffer, {
       identifier: req.file.originalname,
       mime: req.file.mimetype,
     });
-    logger.debug("Image uploaded to Walrus", { imageHash });
+    logger.info("Image uploaded to Walrus", { 
+      imageBlobId: imageUpload.blobId, 
+      imagePatchId: imageUpload.patchId 
+    });
     
+    // 2. Store flow metadata JSON (references the image patchId)
     const flowObj: FlowObject = {
       kind: "flow",
       type: "IMAGE",
-      imageHash,
+      imagePatchId: imageUpload.patchId,  // Reference to image
       mime: req.file.mimetype,
       ...(caption ? { caption } : {}),
       createdAt: nowISO
     };
-    const flowHash = await storeFlowObject(flowObj);
-    logger.debug("Image flow metadata stored", { flowHash });
+    const { blobId, patchId } = await storeFlowObject(flowObj);
+    logger.info("Flow metadata stored in Walrus", { blobId, patchId });
 
+    // 3. Save to database with CORRECT values
     await prisma.flow.create({
-      data: { type: "IMAGE", walrusHash: flowHash, imageHash, mime: req.file.mimetype, createdAt: new Date() }
+      data: { 
+        type: "IMAGE", 
+        blobId,                          // Flow metadata blob ID
+        patchId,                         // Flow metadata patch ID
+        imageBlobId: imageUpload.blobId, // Image blob ID
+        imagePatchId: imageUpload.patchId, // Image patch ID (USE THIS TO FETCH IMAGE!)
+        mime: req.file.mimetype, 
+        createdAt: new Date() 
+      }
     });
-    logger.debug("Image flow saved to DB");
+    logger.info("Image flow saved to DB", { blobId, patchId, imagePatchId: imageUpload.patchId });
 
-    const tx = await log_action(ActionType.FLOW, flowHash);
-    logger.info("Image flow created", { flowHash, imageHash, tx: tx.txId });
-    return res.status(201).json({ ok: true, hash: flowHash, type: "IMAGE", imageHash, tx });
+    const tx = await log_action(ActionType.FLOW, patchId);
+    
+    return res.status(201).json({ 
+      ok: true, 
+      type: "IMAGE",
+      blobId,
+      patchId,
+      imageBlobId: imageUpload.blobId,
+      imagePatchId: imageUpload.patchId,
+      tx 
+    });
   } catch (err) {
     logger.error("POST /flows failed", err);
     next(err);
@@ -221,43 +205,11 @@ app.post("/flows", upload.single("image"), async (req, res, next) => {
 });
 
 /**
- * @swagger
- * /flows:
- *   get:
- *     tags: [Flows]
- *     summary: List flows with pagination
- *     description: Get paginated list of flows (newest first), hydrated from Walrus
- *     parameters:
- *       - name: limit
- *         in: query
- *         schema:
- *           type: integer
- *           default: 20
- *           maximum: 50
- *         description: Maximum number of flows to return
- *       - name: cursor
- *         in: query
- *         schema:
- *           type: string
- *           format: date-time
- *         description: ISO datetime cursor for pagination
- *     responses:
- *       200:
- *         description: List of flows retrieved successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 ok:
- *                   type: boolean
- *                 items:
- *                   type: array
- *                   items:
- *                     type: object
- *                 nextCursor:
- *                   type: string
- *                   nullable: true
+ * GET /flows - List flows with pagination
+ * 
+ * Returns:
+ * - patchId: Use to fetch flow metadata
+ * - imagePatchId: Use to fetch image (for IMAGE type)
  */
 app.get("/flows", async (req, res, next) => {
   try {
@@ -270,12 +222,52 @@ app.get("/flows", async (req, res, next) => {
       take: limit + 1
     });
 
-    const items = await Promise.all(
-      rows.slice(0, limit).map(async (r: { walrusHash: string; createdAt: { toISOString: () => any; }; }) => {
-        const flow = await loadFlowObject(r.walrusHash as WalrusHash);
-        return { hash: r.walrusHash, createdAt: r.createdAt.toISOString(), flow };
-      })
-    );
+    const slice = rows.slice(0, limit);
+    logger.debug("GET /flows", { count: slice.length });
+
+    const items = await Promise.all(slice.map(async (r) => {
+      try {
+        // Fetch flow metadata from Walrus using patchId
+        const flex = await walrusIO.readFlexible(r.patchId);
+        
+        let flowData: any = null;
+        if (r.type === "TEXT") {
+          if (flex.kind === "json" && typeof flex.data?.text === "string") {
+            flowData = { type: "TEXT", text: flex.data.text };
+          } else if (flex.kind === "text") {
+            flowData = { type: "TEXT", text: flex.data };
+          } else {
+            flowData = { type: "TEXT", text: "" };
+          }
+        } else if (r.type === "IMAGE") {
+          flowData = { 
+            type: "IMAGE", 
+            imagePatchId: r.imagePatchId,  // From DB - correct value!
+            caption: flex.kind === "json" ? flex.data?.caption : undefined,
+            mime: r.mime || "image/jpeg" 
+          };
+        }
+        
+        return { 
+          blobId: r.blobId,
+          patchId: r.patchId,
+          imageBlobId: r.imageBlobId,
+          imagePatchId: r.imagePatchId,
+          createdAt: r.createdAt.toISOString(), 
+          flow: flowData 
+        };
+      } catch (err) {
+        logger.error("Failed to load flow", { patchId: r.patchId, error: err instanceof Error ? err.message : String(err) });
+        return { 
+          blobId: r.blobId,
+          patchId: r.patchId,
+          imageBlobId: r.imageBlobId,
+          imagePatchId: r.imagePatchId,
+          createdAt: r.createdAt.toISOString(), 
+          flow: null 
+        };
+      }
+    }));
 
     const nextCursor = rows.length > limit ? rows[limit].createdAt.toISOString() : null;
     res.json({ ok: true, items, nextCursor });
@@ -284,257 +276,134 @@ app.get("/flows", async (req, res, next) => {
   }
 });
 
-/* --------------------------- GLOWS & PROMOTES ---------------------------- */
 /**
- * @swagger
- * /glows:
- *   post:
- *     tags: [Social]
- *     summary: Glow (like) a flow
- *     description: Register a glow action for a flow (similar to a "like")
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             $ref: '#/components/schemas/GlowRequest'
- *     responses:
- *       201:
- *         description: Glow created successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 ok:
- *                   type: boolean
- *                 hash:
- *                   type: string
- *                 tx:
- *                   $ref: '#/components/schemas/ChainTx'
- *       404:
- *         description: Flow not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
+ * GET /image/:patchId - Fetch image from Walrus
+ * 
+ * Use imagePatchId from flow to fetch the actual image!
  */
+app.get("/image/:patchId", async (req, res, next) => {
+  try {
+    const patchId = req.params.patchId;
+    logger.debug("GET /image/:patchId", { patchId });
+    
+    const { data, identifier, contentType } = await walrusIO.fetchByPatchId(patchId);
+    
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    res.send(data);
+    
+    logger.info("Image served", { patchId, size: data.length, contentType });
+  } catch (err) {
+    logger.error("GET /image/:patchId failed", { patchId: req.params.patchId, error: err instanceof Error ? err.message : String(err) });
+    res.status(404).json({ ok: false, error: "Image not found" });
+  }
+});
+
+/* --------------------------- GLOWS & PROMOTES ---------------------------- */
 app.post("/glows", async (req, res, next) => {
   try {
-    const { flowHash, actorId } = postGlowSchema.parse(req.body);
-    const flow = await prisma.flow.findUnique({ where: { walrusHash: flowHash } });
+    const { flowPatchId, actorId } = postGlowSchema.parse(req.body);
+    
+    // Find flow by patchId
+    const flow = await prisma.flow.findUnique({ where: { patchId: flowPatchId } });
     if (!flow) return res.status(404).json({ ok: false, error: "Flow not found" });
 
     const actionObj: ActionObject = {
       kind: "action",
       action: ActionType.GLOW,
-      flowHash,
+      flowPatchId,
       actorId,
       createdAt: new Date().toISOString()
     };
-    const actionHash = await storeActionObject(actionObj);
+    const { blobId, patchId } = await storeActionObject(actionObj);
 
-    await prisma.glow.create({ data: { walrusHash: actionHash, flowHash, actorId, createdAt: new Date() } });
-    const tx = await log_action(ActionType.GLOW, actionHash, actorId);
-
-    res.status(201).json({ ok: true, hash: actionHash, tx });
+    await prisma.glow.create({ 
+      data: { 
+        flowPatchId,
+        blobId,
+        patchId,
+        actorId, 
+        createdAt: new Date() 
+      } 
+    });
+    
+    const tx = await log_action(ActionType.GLOW, patchId, actorId);
+    res.status(201).json({ ok: true, blobId, patchId, tx });
   } catch (err) {
     next(err);
   }
 });
 
-/**
- * @swagger
- * /promotes:
- *   post:
- *     tags: [Social]
- *     summary: Promote a flow
- *     description: Boost visibility of a flow (+10 visibility points)
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             $ref: '#/components/schemas/PromoteRequest'
- *     responses:
- *       201:
- *         description: Promote created successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 ok:
- *                   type: boolean
- *                 hash:
- *                   type: string
- *                 tx:
- *                   $ref: '#/components/schemas/ChainTx'
- *       404:
- *         description: Flow not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- */
 app.post("/promotes", async (req, res, next) => {
   try {
-    const { flowHash, actorId } = postPromoteSchema.parse(req.body);
-    const flow = await prisma.flow.findUnique({ where: { walrusHash: flowHash } });
+    const { flowPatchId, actorId } = postPromoteSchema.parse(req.body);
+    
+    const flow = await prisma.flow.findUnique({ where: { patchId: flowPatchId } });
     if (!flow) return res.status(404).json({ ok: false, error: "Flow not found" });
 
     const actionObj: ActionObject = {
       kind: "action",
       action: ActionType.PROMOTE,
-      flowHash,
+      flowPatchId,
       actorId,
       visibilityBoost: 10,
       createdAt: new Date().toISOString()
     };
-    const actionHash = await storeActionObject(actionObj);
+    const { blobId, patchId } = await storeActionObject(actionObj);
 
     await prisma.promote.create({
-      data: { walrusHash: actionHash, flowHash, actorId, visibilityBoost: 10, createdAt: new Date() }
+      data: { 
+        flowPatchId,
+        blobId,
+        patchId,
+        actorId, 
+        visibilityBoost: 10, 
+        createdAt: new Date() 
+      }
     });
-    const tx = await log_action(ActionType.PROMOTE, actionHash, actorId);
-
-    res.status(201).json({ ok: true, hash: actionHash, tx });
+    
+    const tx = await log_action(ActionType.PROMOTE, patchId, actorId);
+    res.status(201).json({ ok: true, blobId, patchId, tx });
   } catch (err) {
     next(err);
   }
 });
 
 /* ------------------------------ GROUPS API ------------------------------- */
-/**
- * @swagger
- * /rooms:
- *   post:
- *     tags: [Groups]
- *     summary: Create a new room
- *     description: Create a public room group on the blockchain
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             $ref: '#/components/schemas/GroupRequest'
- *     responses:
- *       201:
- *         description: Room created successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 ok:
- *                   type: boolean
- *                 group:
- *                   type: object
- *                 metaHash:
- *                   type: string
- *                 tx:
- *                   $ref: '#/components/schemas/ChainTx'
- */
 app.post("/rooms", async (req, res, next) => {
   try {
     const { type, name } = postGroupSchema.parse({ ...req.body, type: "room" });
-    // Walrus: store group metadata
     const gMeta: GroupMetaObject = { kind: "groupMeta", type, name, createdAt: new Date().toISOString() };
-    const metaHash = await storeGroupMeta(gMeta);
+    const { blobId, patchId } = await storeGroupMeta(gMeta);
 
     const created = await create_group(type, name);
     const row = await prisma.group.create({
-      data: { groupId: created.chainGroupId, type, name }
+      data: { groupId: created.chainGroupId, type, name, blobId, patchId }
     });
 
-    // Optionally: store metaHash in DB if you add a column later
-    res.status(201).json({ ok: true, group: row, metaHash, tx: created.tx });
+    res.status(201).json({ ok: true, group: row, blobId, patchId, tx: created.tx });
   } catch (err) {
     next(err);
   }
 });
 
-/**
- * @swagger
- * /circles:
- *   post:
- *     tags: [Groups]
- *     summary: Create a new circle
- *     description: Create a private circle group on the blockchain
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             $ref: '#/components/schemas/GroupRequest'
- *     responses:
- *       201:
- *         description: Circle created successfully
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 ok:
- *                   type: boolean
- *                 group:
- *                   type: object
- *                 metaHash:
- *                   type: string
- *                 tx:
- *                   $ref: '#/components/schemas/ChainTx'
- */
 app.post("/circles", async (req, res, next) => {
   try {
     const { type, name } = postGroupSchema.parse({ ...req.body, type: "circle" });
     const gMeta: GroupMetaObject = { kind: "groupMeta", type, name, createdAt: new Date().toISOString() };
-    const metaHash = await storeGroupMeta(gMeta);
+    const { blobId, patchId } = await storeGroupMeta(gMeta);
 
     const created = await create_group(type, name);
     const row = await prisma.group.create({
-      data: { groupId: created.chainGroupId, type, name }
+      data: { groupId: created.chainGroupId, type, name, blobId, patchId }
     });
 
-    res.status(201).json({ ok: true, group: row, metaHash, tx: created.tx });
+    res.status(201).json({ ok: true, group: row, blobId, patchId, tx: created.tx });
   } catch (err) {
     next(err);
   }
 });
 
-/**
- * @swagger
- * /join:
- *   post:
- *     tags: [Groups]
- *     summary: Join a group
- *     description: Add a member to a room or circle
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             $ref: '#/components/schemas/JoinRequest'
- *     responses:
- *       201:
- *         description: Successfully joined group
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 ok:
- *                   type: boolean
- *                 membership:
- *                   type: object
- *                 tx:
- *                   $ref: '#/components/schemas/ChainTx'
- *       404:
- *         description: Group not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- */
 app.post("/join", async (req, res, next) => {
   try {
     const { groupId, memberId } = postJoinSchema.parse(req.body);
@@ -550,178 +419,44 @@ app.post("/join", async (req, res, next) => {
 });
 
 /* --------------------------------- CHAT ---------------------------------- */
-/**
- * @swagger
- * /chat:
- *   post:
- *     tags: [Chat]
- *     summary: Send a chat message 💬
- *     description: |
- *       **YES! This backend supports chat messaging!**
- *       
- *       Send messages to groups (rooms/circles) or general chat.
- *       Messages are stored in Walrus (content-addressed storage) and logged on the blockchain.
- *       Real-time events are broadcast via the /events SSE endpoint.
- *       
- *       Features:
- *       - Group-based messaging
- *       - Actor/user attribution
- *       - Immutable storage in Walrus
- *       - On-chain verification via Sui
- *       - Real-time SSE notifications
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             $ref: '#/components/schemas/ChatRequest'
- *           examples:
- *             groupMessage:
- *               summary: Message to a group
- *               value:
- *                 text: "Hello everyone! 👋"
- *                 groupId: "grp_room_123"
- *                 actorId: "user456"
- *             generalMessage:
- *               summary: General message (no group)
- *               value:
- *                 text: "Hello world!"
- *                 actorId: "user789"
- *     responses:
- *       201:
- *         description: Chat message sent successfully
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ChatResponse'
- *             example:
- *               ok: true
- *               hash: "e986f1b088e7bf1a4fc3add93f71c5fe..."
- *               tx:
- *                 txId: "8xKpT9..."
- *                 network: "sui"
- *       400:
- *         description: Invalid request or external links not allowed
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- */
 app.post("/chat", async (req, res, next) => {
   try {
     const { text, groupId, actorId } = postChatSchema.parse(req.body);
     assertNoExternalLinks(text);
 
     const chatObj: ChatObject = { kind: "chat", text, groupId, actorId, createdAt: new Date().toISOString() };
-    const chatHash = await storeChatObject(chatObj);
+    const { blobId, patchId } = await storeChatObject(chatObj);
 
-    // index minimally if you have a Chat table; otherwise skip DB
-    // await prisma.chat.create({ data: { walrusHash: chatHash, groupId, actorId } });
-
-    const tx = await log_action(ActionType.CHAT, chatHash, actorId);
-    res.status(201).json({ ok: true, hash: chatHash, tx });
+    const tx = await log_action(ActionType.CHAT, patchId, actorId);
+    res.status(201).json({ ok: true, blobId, patchId, tx });
   } catch (err) {
     next(err);
   }
 });
 
-/* ------------------------------ VERIFY HASH ------------------------------ */
-/**
- * @swagger
- * /verify:
- *   get:
- *     tags: [Verification]
- *     summary: Verify action hash on blockchain
- *     description: Check if a Walrus hash has been logged on-chain (implementation depends on CHAIN_MODE)
- *     parameters:
- *       - name: hash
- *         in: query
- *         required: true
- *         schema:
- *           type: string
- *         description: Walrus hash to verify
- *         example: "0a17dcffcd3e1d9e6e12a81b2ba57003810a114a26b4e836733083f3460a7d3f"
- *     responses:
- *       200:
- *         description: Verification result
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 ok:
- *                   type: boolean
- *                 valid:
- *                   type: boolean
- *                   description: Whether the hash is verified on-chain
- *                 network:
- *                   type: string
- *                   enum: [stub, sui, evm]
- *             example:
- *               ok: true
- *               valid: true
- *               network: "sui"
- *       400:
- *         description: Hash parameter required
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- */
+/* ------------------------------ VERIFY & HEALTH -------------------------- */
 app.get("/verify", async (req, res, next) => {
   try {
-    const hash = (req.query.hash ?? "").toString();
-    if (!hash) return res.status(400).json({ ok: false, error: "hash is required" });
-
-    const result = await verify_action(hash as WalrusHash);
+    const patchId = (req.query.patchId ?? "").toString();
+    if (!patchId) return res.status(400).json({ ok: false, error: "patchId is required" });
+    const result = await verify_action(patchId as WalrusPatchId);
     return res.json({ ok: true, ...result });
   } catch (err) {
     next(err);
   }
 });
 
-/* --------------------------------- MISC ---------------------------------- */
-/**
- * @swagger
- * /health:
- *   get:
- *     tags: [Health]
- *     summary: Health check endpoint
- *     description: Simple liveness check for the API
- *     responses:
- *       200:
- *         description: API is healthy
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/SuccessResponse'
- *             example:
- *               ok: true
- */
 app.get("/health", (_req, res) => {
-  logger.debug("GET /health");
   res.json({ ok: true });
 });
 
 app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  logger.error("Request error", { 
-    method: req.method, 
-    path: req.path, 
-    error: err?.message,
-    stack: err?.stack 
-  });
+  logger.error("Request error", { method: req.method, path: req.path, error: err?.message });
   res.status((err && err.status) || 500).json({ ok: false, error: err?.message ?? "Internal error" });
 });
 
 const PORT = Number(process.env.PORT || 4000);
 app.listen(PORT, () => {
-  logger.info("Server started", {
-    port: PORT,
-    walrusMode: process.env.WALRUS_MODE,
-    chainMode: process.env.CHAIN_MODE,
-    logLevel: process.env.LOG_LEVEL || "info"
-  });
-  console.log(
-    `Social Hub API :${PORT} — Walrus=${process.env.WALRUS_MODE}  Chain=${process.env.CHAIN_MODE}`
-  );
+  logger.info("Server started", { port: PORT, walrusMode: process.env.WALRUS_MODE, chainMode: process.env.CHAIN_MODE });
+  console.log(`Social Hub API :${PORT} — Walrus=${process.env.WALRUS_MODE}  Chain=${process.env.CHAIN_MODE}`);
 });

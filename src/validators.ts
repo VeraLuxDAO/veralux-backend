@@ -2,6 +2,10 @@ import { z } from "zod";
 
 const urlRegex = /(https?:\/\/[^\s]+)/gi;
 
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
 export function parseAllowedHosts(): string[] {
   const raw = process.env.ALLOWED_LINK_HOSTS ?? "";
   return raw
@@ -39,18 +43,84 @@ export function assertNoExternalLinks(text?: string) {
   }
 }
 
+// =============================================================================
+// Authentication Schemas
+// =============================================================================
+
+/**
+ * Sui wallet address validation
+ * Format: 0x followed by 64 hex characters
+ */
+const suiAddressSchema = z
+  .string()
+  .regex(/^0x[a-fA-F0-9]{64}$/, "Invalid Sui wallet address format");
+
+/**
+ * Request nonce for wallet authentication
+ */
+export const authNonceSchema = z.object({
+  walletAddress: suiAddressSchema
+});
+
+/**
+ * Authenticate with wallet signature
+ */
+export const authLoginSchema = z.object({
+  walletAddress: suiAddressSchema,
+  signature: z
+    .string()
+    .min(10, "Signature is required")
+    .max(500, "Signature too long")
+});
+
+/**
+ * Refresh access token
+ */
+export const authRefreshSchema = z.object({
+  refreshToken: z
+    .string()
+    .min(10, "Refresh token is required")
+});
+
+/**
+ * Update user profile
+ */
+export const updateProfileSchema = z.object({
+  username: z
+    .string()
+    .min(3, "Username must be at least 3 characters")
+    .max(30, "Username must be at most 30 characters")
+    .regex(/^[a-zA-Z0-9_]+$/, "Username can only contain letters, numbers, and underscores")
+    .optional(),
+  displayName: z
+    .string()
+    .min(1, "Display name must be at least 1 character")
+    .max(50, "Display name must be at most 50 characters")
+    .optional(),
+  bio: z
+    .string()
+    .max(500, "Bio must be at most 500 characters")
+    .optional()
+});
+
+// =============================================================================
+// Flow Schemas
+// =============================================================================
+
+// =============================================================================
+// Flow Schemas
+// =============================================================================
+
 export const postFlowTextSchema = z.object({
   text: z.string().min(1).max(2000)
 });
 
 export const postGlowSchema = z.object({
-  flowPatchId: z.string().min(10),
-  actorId: z.string().optional()
+  flowPatchId: z.string().min(10)
 });
 
 export const postPromoteSchema = z.object({
-  flowPatchId: z.string().min(10),
-  actorId: z.string().optional()
+  flowPatchId: z.string().min(10)
 });
 
 export const postGroupSchema = z.object({
@@ -59,12 +129,10 @@ export const postGroupSchema = z.object({
 });
 
 export const postJoinSchema = z.object({
-  groupId: z.string().min(1),
-  memberId: z.string().min(1)
+  groupId: z.string().min(1)
 });
 
 export const postChatSchema = z.object({
   text: z.string().min(1).max(2000),
-  groupId: z.string().optional(),
-  actorId: z.string().optional()
+  groupId: z.string().optional()
 });

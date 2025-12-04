@@ -12,6 +12,70 @@ export enum ActionType {
   GROUP_JOIN = "GROUP_JOIN"
 }
 
+// =============================================================================
+// Express Request Extensions
+// =============================================================================
+
+declare global {
+  namespace Express {
+    interface Request {
+      user?: {
+        id: string;
+        walletAddress: string;
+        username: string | null;
+        displayName: string | null;
+        avatarPatchId: string | null;
+        bio: string | null;
+      };
+    }
+  }
+}
+
+// =============================================================================
+// Authentication Types
+// =============================================================================
+
+/**
+ * User profile returned to clients (sensitive fields excluded)
+ */
+export interface UserProfile {
+  id: string;
+  walletAddress: string;
+  username: string | null;
+  displayName: string | null;
+  avatarPatchId: string | null;
+  bio: string | null;
+  lastLoginAt: string;
+  createdAt: string;
+}
+
+/**
+ * Authentication tokens response
+ */
+export interface AuthTokensResponse {
+  accessToken: string;
+  refreshToken: string;
+  expiresIn: number;
+  user: UserProfile;
+}
+
+/**
+ * Nonce response for wallet authentication
+ */
+export interface NonceResponse {
+  nonce: string;
+  message: string;
+  expiresAt: string;
+}
+
+// =============================================================================
+// Content Types (Walrus Objects)
+// =============================================================================
+
+// =============================================================================
+// Content Types (Walrus Objects)
+// =============================================================================
+
 /** Content objects that land in Walrus */
 export type FlowObject =
   | {

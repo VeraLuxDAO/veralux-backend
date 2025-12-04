@@ -7,6 +7,46 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// =============================================================================
+// USER AUTHENTICATION
+// =============================================================================
+// Users are identified by their Sui wallet address. Authentication flow:
+// 1. Client requests a nonce from /auth/nonce
+// 2. Client signs the nonce with their wallet
+// 3. Client submits signature to /auth - creates user if new, returns JWT
+// 4. JWT is used for authenticated requests
+model User {
+  id            String    @id @default(cuid())
+  walletAddress String    @unique  // Sui wallet address (primary identifier)
+  nonce         String?            // Random nonce for signature verification
+  nonceExpiresAt DateTime?         // Nonce expiration time
+  
+  // Profile info (optional, can be updated later)
+  username      String?   @unique
+  displayName   String?
+  avatarBlobId  String?            // Walrus blob ID for profile avatar
+  avatarPatchId String?            // Walrus patch ID for profile avatar
+  bio           String?
+  
+  // Session management
+  refreshToken  String?   @unique  // Hashed refresh token for token renewal
+  refreshTokenExpiresAt DateTime?  // Refresh token expiration
+  
+  // Timestamps
+  lastLoginAt   DateTime  @default(now())
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  
+  // Relations
+  flows         Flow[]    @relation("FlowAuthor")
+  glows         Glow[]    @relation("GlowActor")
+  promotes      Promote[] @relation("PromoteActor")
+  memberships   Membership[] @relation("MembershipUser")
+  chats         Chat[]    @relation("ChatActor")
+  
+  @@index([walletAddress])
+}
+
 enum FlowType {
   TEXT
   IMAGE
@@ -32,7 +72,13 @@ model Flow {
   
   mime          String?
   createdAt     DateTime  @default(now())
+  
+  // Author relation
   authorId      String?
+  author        User?     @relation("FlowAuthor", fields: [authorId], references: [id])
+  
+  @@index([authorId])
+  @@index([createdAt])
 }
 
 model Glow {
@@ -40,9 +86,14 @@ model Glow {
   flowPatchId String   // Flow.patchId that was glowed
   blobId      String   // Walrus blob ID
   patchId     String   // Walrus patch ID for glow action
-  actorId     String?
   createdAt   DateTime @default(now())
+  
+  // Actor relation
+  actorId     String?
+  actor       User?    @relation("GlowActor", fields: [actorId], references: [id])
+  
   @@index([flowPatchId])
+  @@index([actorId])
 }
 
 model Promote {
@@ -51,9 +102,14 @@ model Promote {
   blobId          String   // Walrus blob ID
   patchId         String   // Walrus patch ID for promote action
   visibilityBoost Int      @default(10)
-  actorId         String?
   createdAt       DateTime @default(now())
+  
+  // Actor relation
+  actorId         String?
+  actor           User?    @relation("PromoteActor", fields: [actorId], references: [id])
+  
   @@index([flowPatchId])
+  @@index([actorId])
 }
 
 model Group {
@@ -69,7 +125,29 @@ model Group {
 model Membership {
   id        String   @id @default(cuid())
   groupId   String
-  memberId  String
   createdAt DateTime @default(now())
+  
+  // Member relation
+  memberId  String?
+  member    User?    @relation("MembershipUser", fields: [memberId], references: [id])
+  
   @@index([groupId])
+  @@index([memberId])
+}
+
+model Chat {
+  id        String   @id @default(cuid())
+  groupId   String   // Group.groupId (blockchain ID)
+  text      String
+  blobId    String   // Walrus blob ID
+  patchId   String   // Walrus patch ID
+  createdAt DateTime @default(now())
+  
+  // Author relation
+  actorId   String?
+  actor     User?    @relation("ChatActor", fields: [actorId], references: [id])
+  
+  @@index([groupId])
+  @@index([actorId])
+  @@index([createdAt])
 }

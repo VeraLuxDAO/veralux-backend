@@ -134,5 +134,5 @@ export const postJoinSchema = z.object({
 
 export const postChatSchema = z.object({
   text: z.string().min(1).max(2000),
-  groupId: z.string().optional()
+  groupId: z.string().min(1) // Required for chat messages
 });

@@ -83,12 +83,8 @@ export interface AuthTokens {
   expiresIn: number;     // Access token expiry in seconds
 }
 
-export interface AuthenticatedRequest extends Request {
-  user?: {
-    id: string;
-    walletAddress: string;
-  };
-}
+// Note: AuthenticatedRequest type is defined globally in types.ts
+// via Express.Request augmentation
 
 // =============================================================================
 // Nonce Management
@@ -313,7 +309,7 @@ export function hashRefreshToken(token: string): string {
  * Attaches user info to request object
  */
 export function requireAuth(
-  req: AuthenticatedRequest,
+  req: Request,
   res: Response,
   next: NextFunction
 ): void {
@@ -342,7 +338,11 @@ export function requireAuth(
   
   req.user = {
     id: payload.sub,
-    walletAddress: payload.wallet
+    walletAddress: payload.wallet,
+    username: null,
+    displayName: null,
+    avatarPatchId: null,
+    bio: null
   };
   
   logger.debug("Authenticated request", { userId: payload.sub, wallet: payload.wallet });
@@ -354,7 +354,7 @@ export function requireAuth(
  * Attaches user info if token is valid, but doesn't require it
  */
 export function optionalAuth(
-  req: AuthenticatedRequest,
+  req: Request,
   res: Response,
   next: NextFunction
 ): void {
@@ -367,7 +367,11 @@ export function optionalAuth(
     if (payload) {
       req.user = {
         id: payload.sub,
-        walletAddress: payload.wallet
+        walletAddress: payload.wallet,
+        username: null,
+        displayName: null,
+        avatarPatchId: null,
+        bio: null
       };
     }
   }

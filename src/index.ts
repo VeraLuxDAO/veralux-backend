@@ -38,9 +38,14 @@ import {
   optionalAuth,
   refreshAccessToken,
   requireAuth,
-  updateUserProfile,
-  type AuthenticatedRequest
+  updateUserProfile
 } from "./auth.js";
+
+// Route modules
+import authRoutes from "./routes/auth.js";
+import groupRoutes from "./routes/groups.js";
+import circleRoutes from "./routes/circles.js";
+import chatRoutes from "./routes/chat.js";
 
 const logger = createLogger("api");
 logger.info("Initializing Prisma client");
@@ -69,6 +74,9 @@ process.on("uncaughtException", (error) => {
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10MB
 
+// Store prisma instance for routes to access
+app.set("prisma", prisma);
+
 // CORS configuration
 app.use(cors({
   origin: '*',
@@ -84,20 +92,29 @@ app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
   customCss: ".swagger-ui .topbar { display: none }",
 }));
 
+/* ------------------------------ ROUTE MODULES ------------------------------- */
+app.use("/auth", authRoutes);
+app.use("/groups", groupRoutes);
+app.use("/circles", circleRoutes);
+app.use("/chat", chatRoutes);
+
 /* ------------------------------ SSE: /events ------------------------------ */
-type SSEClient = { id: number; res: express.Response };
+type SSEClient = { id: number; res: express.Response; userId?: number };
 const clients = new Map<number, SSEClient>();
 let nextClientId = 1;
 
-app.get("/events", (req, res) => {
+app.get("/events", optionalAuth, (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.flushHeaders?.();
   const id = nextClientId++;
-  clients.set(id, { id, res });
-  logger.info("SSE client connected", { clientId: id, totalClients: clients.size });
+  const userId = req.user?.id;
+  // Convert string userId to number if present
+  const userIdNum = userId ? parseInt(userId, 10) : undefined;
+  clients.set(id, { id, res, userId: userIdNum });
+  logger.info("SSE client connected", { clientId: id, userId: userIdNum, totalClients: clients.size });
   const iv = setInterval(() => res.write(`event: ping\ndata: {}\n\n`), 15000);
   req.on("close", () => {
     clearInterval(iv);
@@ -106,9 +123,32 @@ app.get("/events", (req, res) => {
   });
 });
 
-function broadcast(e: unknown) {
+function broadcast(e: unknown, groupId?: number) {
   const payload = `data: ${JSON.stringify(e)}\n\n`;
-  clients.forEach(({ res }) => res.write(payload));
+  
+  if (groupId !== undefined) {
+    // For chat messages, only send to users who are members of the group
+    // Need to query by groupId (which is stored as string in DB)
+    prisma.membership.findMany({
+      where: { groupId: groupId.toString() },
+      select: { memberId: true }
+    }).then((members: any[]) => {
+      // Convert member IDs to numbers for comparison
+      const memberIds = new Set(members.map((m: any) => m.memberId ? parseInt(m.memberId, 10) : null).filter((id: number | null) => id !== null));
+      clients.forEach(({ res, userId }) => {
+        if (userId && memberIds.has(userId)) {
+          res.write(payload);
+        }
+      });
+    }).catch((err: any) => {
+      logger.error("Error filtering broadcast by group", { error: err.message, groupId });
+      // Fallback: broadcast to all if error
+      clients.forEach(({ res }) => res.write(payload));
+    });
+  } else {
+    // For non-chat events (blockchain), broadcast to all
+    clients.forEach(({ res }) => res.write(payload));
+  }
 }
 onChainEvent((e) => broadcast(e));
 
@@ -131,6 +171,10 @@ function toUserProfile(user: any): UserProfile {
     createdAt: user.createdAt?.toISOString() ?? new Date().toISOString()
   };
 }
+
+/* ========================================================================== */
+/* USER PROFILE ENDPOINTS                                                     */
+/* ========================================================================== */
 
 // ============================================================================
 // NONCE ENDPOINT (COMMENTED OUT - For future signature verification)
@@ -311,163 +355,7 @@ function toUserProfile(user: any): UserProfile {
 //   }
 // });
 
-/**
- * POST /auth - Simple wallet-based login (Temporary - No signature verification)
- * 
- * Creates or logs in user by wallet address only.
- * TODO: Implement signature verification in the future.
- * 
- * @body walletAddress - The Sui wallet address
- * @returns Access token, refresh token, and user profile
- */
-app.post("/auth", async (req, res, next) => {
-  try {
-    const walletAddress = (req.body.walletAddress ?? "").toString();
-    
-    if (!walletAddress) {
-      return res.status(400).json({
-        ok: false,
-        error: "walletAddress is required",
-        code: "MISSING_WALLET_ADDRESS"
-      });
-    }
-    
-    if (!isValidSuiAddress(walletAddress)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid Sui wallet address format",
-        code: "INVALID_WALLET_ADDRESS"
-      });
-    }
-    
-    const normalizedAddress = walletAddress.toLowerCase();
-    
-    // Find or create user
-    let user = await prisma.user.findUnique({
-      where: { walletAddress: normalizedAddress }
-    });
-    
-    if (!user) {
-      // Create new user
-      user = await prisma.user.create({
-        data: {
-          walletAddress: normalizedAddress,
-          lastLoginAt: new Date()
-        }
-      });
-      logger.info("New user created", { userId: user.id, walletAddress: normalizedAddress });
-    } else {
-      // Update last login
-      user = await prisma.user.update({
-        where: { id: user.id },
-        data: { lastLoginAt: new Date() }
-      });
-      logger.info("User logged in", { userId: user.id, walletAddress: normalizedAddress });
-    }
-    
-    // Generate tokens
-    const { generateTokens } = await import("./auth.js");
-    const tokens = generateTokens(user.id, normalizedAddress);
-    const { hashRefreshToken } = await import("./auth.js");
-    const hashedRefreshToken = hashRefreshToken(tokens.refreshToken);
-    
-    // Store refresh token
-    const refreshTokenExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
-    await prisma.user.update({
-      where: { id: user.id },
-      data: {
-        refreshToken: hashedRefreshToken,
-        refreshTokenExpiresAt
-      }
-    });
-    
-    res.json({
-      ok: true,
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
-      expiresIn: tokens.expiresIn,
-      user: toUserProfile(user)
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-/**
- * POST /auth/refresh - Refresh access token
- * 
- * @body refreshToken - The refresh token
- * @returns New access token and refresh token
- */
-app.post("/auth/refresh", async (req, res, next) => {
-  try {
-    const parsed = authRefreshSchema.parse(req.body);
-    
-    const result = await refreshAccessToken(prisma, parsed.refreshToken);
-    
-    if ("error" in result) {
-      return res.status(401).json({
-        ok: false,
-        error: result.error,
-        code: result.code
-      });
-    }
-    
-    res.json({
-      ok: true,
-      accessToken: result.tokens.accessToken,
-      refreshToken: result.tokens.refreshToken,
-      expiresIn: result.tokens.expiresIn
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-/**
- * POST /auth/logout - Logout user (invalidate refresh token)
- * 
- * Requires authentication
- */
-app.post("/auth/logout", requireAuth, async (req: AuthenticatedRequest, res, next) => {
-  try {
-    if (!req.user) {
-      return res.status(401).json({ ok: false, error: "Not authenticated" });
-    }
-    
-    await logout(prisma, req.user.id);
-    
-    res.json({ ok: true, message: "Logged out successfully" });
-  } catch (err) {
-    next(err);
-  }
-});
-
-/**
- * GET /auth/me - Get current user profile
- * 
- * Requires authentication
- */
-app.get("/auth/me", requireAuth, async (req: AuthenticatedRequest, res, next) => {
-  try {
-    if (!req.user) {
-      return res.status(401).json({ ok: false, error: "Not authenticated" });
-    }
-    
-    const user = await getUserProfile(prisma, req.user.id);
-    
-    if (!user) {
-      return res.status(404).json({ ok: false, error: "User not found" });
-    }
-    
-    res.json({
-      ok: true,
-      user: toUserProfile(user)
-    });
-  } catch (err) {
-    next(err);
-  }
-});
+// Auth endpoints (POST /auth, /auth/refresh, /auth/logout, GET /auth/profile) are now in ./routes/auth.ts
 
 /**
  * PATCH /auth/me - Update current user profile
@@ -477,7 +365,7 @@ app.get("/auth/me", requireAuth, async (req: AuthenticatedRequest, res, next) =>
  * @body displayName - Optional new display name
  * @body bio - Optional new bio
  */
-app.patch("/auth/me", requireAuth, async (req: AuthenticatedRequest, res, next) => {
+app.patch("/auth/me", requireAuth, async (req: express.Request, res, next) => {
   try {
     if (!req.user) {
       return res.status(401).json({ ok: false, error: "Not authenticated" });
@@ -511,7 +399,7 @@ app.patch("/auth/me", requireAuth, async (req: AuthenticatedRequest, res, next) 
  * Requires authentication
  * Accepts multipart/form-data with 'avatar' field
  */
-app.post("/auth/me/avatar", requireAuth, upload.single("avatar"), async (req: AuthenticatedRequest, res, next) => {
+app.post("/auth/me/avatar", requireAuth, upload.single("avatar"), async (req: express.Request, res, next) => {
   try {
     if (!req.user) {
       return res.status(401).json({ ok: false, error: "Not authenticated" });
@@ -902,206 +790,7 @@ app.post("/promotes", requireAuth, async (req, res, next) => {
   }
 });
 
-/* ------------------------------ GROUPS API ------------------------------- */
-app.get("/groups/rooms", async (req, res, next) => {
-  try {
-    const rooms = await prisma.group.findMany({
-      where: { type: "room" },
-      orderBy: { createdAt: "desc" }
-    });
-    res.json({ ok: true, groups: rooms });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.get("/groups/circles", async (req, res, next) => {
-  try {
-    const circles = await prisma.group.findMany({
-      where: { type: "circle" },
-      orderBy: { createdAt: "desc" }
-    });
-    res.json({ ok: true, groups: circles });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.get("/groups", async (req, res, next) => {
-  try {
-    const groups = await prisma.group.findMany({
-      orderBy: { createdAt: "desc" }
-    });
-    res.json({ ok: true, groups });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post("/rooms", async (req, res, next) => {
-  try {
-    const { type, name } = postGroupSchema.parse({ ...req.body, type: "room" });
-    const gMeta: GroupMetaObject = { kind: "groupMeta", type, name, createdAt: new Date().toISOString() };
-    const { blobId, patchId } = await storeGroupMeta(gMeta);
-
-    const created = await create_group(type, name);
-    const row = await prisma.group.create({
-      data: { groupId: created.chainGroupId, type, name, blobId, patchId }
-    });
-
-    res.status(201).json({ ok: true, group: row, blobId, patchId, tx: created.tx });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post("/circles", async (req, res, next) => {
-  try {
-    const { type, name } = postGroupSchema.parse({ ...req.body, type: "circle" });
-    const gMeta: GroupMetaObject = { kind: "groupMeta", type, name, createdAt: new Date().toISOString() };
-    const { blobId, patchId } = await storeGroupMeta(gMeta);
-
-    const created = await create_group(type, name);
-    const row = await prisma.group.create({
-      data: { groupId: created.chainGroupId, type, name, blobId, patchId }
-    });
-
-    res.status(201).json({ ok: true, group: row, blobId, patchId, tx: created.tx });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post("/join", requireAuth, async (req, res, next) => {
-  try {
-    const { groupId } = postJoinSchema.parse(req.body);
-    const memberId = req.user!.id; // Use authenticated user's ID
-    
-    const group = await prisma.group.findUnique({ where: { groupId } });
-    if (!group) return res.status(404).json({ ok: false, error: "Group not found" });
-
-    // Check if already a member
-    const existing = await prisma.membership.findFirst({
-      where: { groupId, memberId }
-    });
-    if (existing) {
-      return res.status(400).json({ ok: false, error: "You are already a member of this group" });
-    }
-
-    const tx = await join_group(groupId, memberId);
-    const m = await prisma.membership.create({ data: { groupId, memberId } });
-    res.status(201).json({ ok: true, membership: m, tx });
-  } catch (err) {
-    next(err);
-  }
-});
-
-/* --------------------------------- CHAT ---------------------------------- */
-app.get("/chat", async (req, res, next) => {
-  try {
-    const groupId = req.query.groupId?.toString();
-    const limit = Math.min(parseInt(req.query.limit?.toString() || "50"), 100);
-    const offset = parseInt(req.query.offset?.toString() || "0");
-
-    if (!groupId) {
-      return res.status(400).json({ ok: false, error: "groupId query parameter is required" });
-    }
-
-    // Fetch messages from database with user info
-    const messages = await prisma.chat.findMany({
-      where: { groupId },
-      include: {
-        actor: {
-          select: {
-            id: true,
-            walletAddress: true,
-            displayName: true,
-            username: true,
-            avatarPatchId: true
-          }
-        }
-      },
-      orderBy: { createdAt: "asc" },
-      take: limit,
-      skip: offset
-    });
-
-    // Format response to match frontend expectations
-    const formattedMessages = messages.map(msg => ({
-      patchId: msg.patchId,
-      blobId: msg.blobId,
-      text: msg.text,
-      groupId: msg.groupId,
-      actorId: msg.actorId,
-      user: msg.actor,
-      createdAt: msg.createdAt.toISOString()
-    }));
-    
-    res.json({
-      ok: true,
-      messages: formattedMessages,
-      groupId,
-      limit,
-      offset,
-      total: formattedMessages.length
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post("/chat", requireAuth, async (req, res, next) => {
-  try {
-    const { text, groupId } = postChatSchema.parse(req.body);
-    const actorId = req.user!.id; // From authenticated user
-    assertNoExternalLinks(text);
-
-    const chatObj: ChatObject = { 
-      kind: "chat", 
-      text, 
-      groupId, 
-      actorId, 
-      createdAt: new Date().toISOString() 
-    };
-    const { blobId, patchId } = await storeChatObject(chatObj);
-
-    // Save to database
-    await prisma.chat.create({
-      data: {
-        groupId,
-        text,
-        blobId,
-        patchId,
-        actorId,
-        createdAt: new Date()
-      }
-    });
-
-    const tx = await log_action(ActionType.CHAT, patchId, actorId);
-    
-    res.status(201).json({ 
-      ok: true, 
-      message: {
-        patchId,
-        blobId,
-        text,
-        groupId,
-        actorId,
-        user: {
-          id: req.user!.id,
-          walletAddress: req.user!.walletAddress,
-          displayName: req.user!.displayName,
-          username: req.user!.username,
-          avatarPatchId: req.user!.avatarPatchId
-        },
-        createdAt: chatObj.createdAt
-      },
-      tx 
-    });
-  } catch (err) {
-    next(err);
-  }
-});
+// Group, circle, and chat endpoints are now in ./routes/groups.ts, ./routes/circles.ts, and ./routes/chat.ts
 
 /* ------------------------------ VERIFY & HEALTH -------------------------- */
 app.get("/verify", async (req, res, next) => {

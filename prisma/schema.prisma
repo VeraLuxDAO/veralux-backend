@@ -43,6 +43,7 @@ model User {
   promotes      Promote[] @relation("PromoteActor")
   memberships   Membership[] @relation("MembershipUser")
   chats         Chat[]    @relation("ChatActor")
+  groupsCreated Group[]   @relation("GroupCreator")
   
   @@index([walletAddress])
 }
@@ -117,9 +118,17 @@ model Group {
   groupId    String   @unique  // on-chain id
   type       String            // "room" | "circle"
   name       String
+  description String?  // Group description
+  inviteCode String?  @unique  // Invite code for circles (null for rooms)
+  creatorId  String?  // User who created the group
+  creator    User?    @relation("GroupCreator", fields: [creatorId], references: [id])
   blobId     String?  // Walrus blob ID for group metadata
   patchId    String?  // Walrus patch ID for group metadata
   createdAt  DateTime @default(now())
+  
+  @@index([type])
+  @@index([inviteCode])
+  @@index([creatorId])
 }
 
 model Membership {

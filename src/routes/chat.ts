@@ -27,7 +27,7 @@ const sseClients = new Map<string, SSEClient>();
 router.post("/", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user!.id;
-    const { groupId, text, content } = req.body;
+    const { groupId, text, content, replyToId } = req.body;
     
     // Support both 'text' (new) and 'content' (legacy) field names
     const messageText = text || content;
@@ -43,6 +43,14 @@ router.post("/", requireAuth, async (req, res, next) => {
       return res.status(400).json({
         ok: false,
         error: "text is required and must be a string"
+      });
+    }
+
+    // Validate replyToId if provided
+    if (replyToId && typeof replyToId !== "string") {
+      return res.status(400).json({
+        ok: false,
+        error: "replyToId must be a string"
       });
     }
 
@@ -92,7 +100,8 @@ router.post("/", requireAuth, async (req, res, next) => {
         actorId: userId,
         groupId,
         blobId: "placeholder",
-        patchId: `chat-${Date.now()}`
+        patchId: `chat-${Date.now()}`,
+        ...(replyToId && { replyToId })
       },
       include: {
         actor: {
@@ -103,35 +112,69 @@ router.post("/", requireAuth, async (req, res, next) => {
             displayName: true,
             avatarPatchId: true
           }
+        },
+        replyTo: {
+          select: {
+            id: true,
+            text: true,
+            actorId: true,
+            createdAt: true,
+            actor: {
+              select: {
+                id: true,
+                walletAddress: true,
+                username: true,
+                displayName: true,
+                avatarPatchId: true
+              }
+            }
+          }
         }
       }
-    });
+    } as any);
 
     // Broadcast to SSE clients in this group
+    const msg = message as any;
     broadcast({
       type: "message",
       groupId,
       message: {
-        id: message.id,
-        text: message.text,
-        actorId: message.actorId,
-        groupId: message.groupId,
-        actor: message.actor,
-        createdAt: message.createdAt.toISOString()
+        id: msg.id,
+        text: msg.text,
+        actorId: msg.actorId,
+        groupId: msg.groupId,
+        actor: msg.actor,
+        replyToId: msg.replyToId,
+        replyTo: msg.replyTo ? {
+          id: msg.replyTo.id,
+          text: msg.replyTo.text,
+          actorId: msg.replyTo.actorId,
+          actor: msg.replyTo.actor,
+          createdAt: msg.replyTo.createdAt.toISOString()
+        } : null,
+        createdAt: msg.createdAt.toISOString()
       }
     });
 
-    logger.info("Message sent", { userId, groupId, messageId: message.id });
+    logger.info("Message sent", { userId, groupId, messageId: msg.id, replyToId: msg.replyToId });
 
     res.json({
       ok: true,
       message: {
-        id: message.id,
-        text: message.text,
-        actorId: message.actorId,
-        groupId: message.groupId,
-        actor: message.actor,
-        createdAt: message.createdAt.toISOString()
+        id: msg.id,
+        text: msg.text,
+        actorId: msg.actorId,
+        groupId: msg.groupId,
+        actor: msg.actor,
+        replyToId: msg.replyToId,
+        replyTo: msg.replyTo ? {
+          id: msg.replyTo.id,
+          text: msg.replyTo.text,
+          actorId: msg.replyTo.actorId,
+          actor: msg.replyTo.actor,
+          createdAt: msg.replyTo.createdAt.toISOString()
+        } : null,
+        createdAt: msg.createdAt.toISOString()
       }
     });
   } catch (err) {
@@ -190,8 +233,25 @@ router.get("/:groupId", requireAuth, async (req, res, next) => {
             displayName: true,
             avatarPatchId: true
           }
+        },
+        replyTo: {
+          select: {
+            id: true,
+            text: true,
+            actorId: true,
+            createdAt: true,
+            actor: {
+              select: {
+                id: true,
+                walletAddress: true,
+                username: true,
+                displayName: true,
+                avatarPatchId: true
+              }
+            }
+          }
         }
-      },
+      } as any,
       take: limit,
       skip: offset,
       orderBy: { createdAt: "asc" }
@@ -200,12 +260,20 @@ router.get("/:groupId", requireAuth, async (req, res, next) => {
     const total = await prisma.chat.count({ where: { groupId } });
 
     // Format messages
-    const formattedMessages = messages.map(m => ({
+    const formattedMessages = messages.map((m: any) => ({
       id: m.id,
       text: m.text,
       actorId: m.actorId,
       groupId: m.groupId,
       actor: m.actor,
+      replyToId: m.replyToId,
+      replyTo: m.replyTo ? {
+        id: m.replyTo.id,
+        text: m.replyTo.text,
+        actorId: m.replyTo.actorId,
+        actor: m.replyTo.actor,
+        createdAt: m.replyTo.createdAt.toISOString()
+      } : null,
       createdAt: m.createdAt.toISOString()
     }));
 

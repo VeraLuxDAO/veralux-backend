@@ -1,5 +1,8 @@
 import swaggerJsdoc from "swagger-jsdoc";
 
+const swaggerPublicUrl = process.env.SWAGGER_SERVER_URL ?? "/";
+const swaggerDevUrl = process.env.SWAGGER_DEV_SERVER ?? `http://localhost:${process.env.PORT ?? "4000"}`;
+
 const options: swaggerJsdoc.Options = {
   definition: {
     openapi: "3.0.0",
@@ -40,14 +43,12 @@ Social Hub backend with Walrus content storage and Sui blockchain integration.
     },
     servers: [
       {
-        url: "http://localhost:{port}",
-        description: "Development server",
-        variables: {
-          port: {
-            default: "4000",
-            description: "Server port"
-          }
-        }
+        url: swaggerPublicUrl,
+        description: "Current host / public server"
+      },
+      {
+        url: swaggerDevUrl,
+        description: "Local development"
       }
     ],
     tags: [

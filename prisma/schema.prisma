@@ -156,7 +156,13 @@ model Chat {
   actorId   String?
   actor     User?    @relation("ChatActor", fields: [actorId], references: [id])
   
+  // Reply feature
+  replyToId String?  // ID of the message being replied to
+  replyTo   Chat?    @relation("ChatReply", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies   Chat[]   @relation("ChatReply")
+  
   @@index([groupId])
   @@index([actorId])
   @@index([createdAt])
+  @@index([replyToId])
 }

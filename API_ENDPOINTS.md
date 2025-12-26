@@ -56,6 +56,8 @@ Complete list of all available API endpoints in the YNX-backend.
 |--------|----------|-------------|---------------|
 | POST | `/chat` | Send message to a group (supports reply with `replyToId`) | Yes |
 | GET | `/chat/:groupId` | Get chat history for a group (includes reply data) | Yes |
+| PATCH | `/chat/:messageId` | Edit own message | Yes |
+| DELETE | `/chat/:messageId` | Delete own message | Yes |
 | GET | `/chat/events/subscribe` | Subscribe to SSE for real-time updates | Yes |
 | POST | `/chat/events/subscribe-group` | Subscribe to specific group's messages | Yes |
 | POST | `/chat/events/unsubscribe-group` | Unsubscribe from group's messages | Yes |
@@ -113,7 +115,7 @@ Complete list of all available API endpoints in the YNX-backend.
 
 ---
 
-## Total Endpoints: 32
+## Total Endpoints: 34
 
 ### Key Features:
 - 🔐 **JWT Authentication** - Wallet-based auth with access/refresh tokens

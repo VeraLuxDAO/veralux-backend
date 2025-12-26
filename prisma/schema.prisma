@@ -151,6 +151,7 @@ model Chat {
   blobId    String   // Walrus blob ID
   patchId   String   // Walrus patch ID
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt  // For tracking edits
   
   // Author relation
   actorId   String?

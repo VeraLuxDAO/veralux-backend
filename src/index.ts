@@ -5,6 +5,7 @@ import multer from "multer";
 import swaggerUi from "swagger-ui-express";
 import { PrismaClient } from "@prisma/client";
 import { createLogger } from "./logger.js";
+import { errorHandler } from "./error-handler.js";
 import {
   assertNoExternalLinks,
   authLoginSchema,
@@ -808,10 +809,8 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  logger.error("Request error", { method: req.method, path: req.path, error: err?.message });
-  res.status((err && err.status) || 500).json({ ok: false, error: err?.message ?? "Internal error" });
-});
+// Centralized error handling middleware (must be last)
+app.use(errorHandler);
 
 const PORT = Number(process.env.PORT || 4000);
 app.listen(PORT, () => {

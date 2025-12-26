@@ -8,6 +8,15 @@ import { PrismaClient } from "@prisma/client";
 import { createLogger } from "../logger.js";
 import { requireAuth } from "../auth.js";
 import { create_group } from "../blockchain.js";
+import {
+  AppError,
+  NotFoundError,
+  ConflictError,
+  ValidationError,
+  AuthorizationError,
+  handlePrismaError,
+  asyncHandler
+} from "../error-handler.js";
 
 const logger = createLogger("groups-routes");
 const router = Router();
@@ -133,182 +142,177 @@ router.get("/:groupId", async (req, res, next) => {
  * POST /groups/rooms - Create a new public room
  * Authenticated users can create rooms
  */
-router.post("/rooms", requireAuth, async (req, res, next) => {
+router.post("/rooms", requireAuth, asyncHandler(async (req: any, res: any, next: any) => {
   try {
     const userId = req.user!.id;
     const { name, description } = req.body;
 
     if (!name || typeof name !== "string") {
-      return res.status(400).json({
-        ok: false,
-        error: "name is required and must be a string"
-      });
+      throw new ValidationError("name is required and must be a string");
     }
 
     const prisma = res.app.get("prisma") as PrismaClient;
 
-    // Create room on blockchain first
-    const created = await create_group("room", name.trim());
-    
-    // Create room in database
-    const group = await prisma.group.create({
-      data: {
-        groupId: created.chainGroupId,
-        name: name.trim(),
-        description: description?.trim() || "",
-        type: "room",
-        creatorId: userId
-      } as any
-    });
+    try {
+      // Create room on blockchain first
+      const created = await create_group("room", name.trim());
+      
+      // Create room in database
+      const group = await prisma.group.create({
+        data: {
+          groupId: created.chainGroupId,
+          name: name.trim(),
+          description: description?.trim() || "",
+          type: "room",
+          creatorId: userId
+        } as any
+      });
 
-    // Add creator as first member
-    await prisma.membership.create({
-      data: {
-        memberId: userId,
-        groupId: group.id
-      }
-    });
+      // Add creator as first member
+      await prisma.membership.create({
+        data: {
+          memberId: userId,
+          groupId: group.id
+        }
+      });
 
-    logger.info("Room created", { groupId: group.id, userId, name });
+      logger.info("Room created", { groupId: group.id, userId, name });
 
-    res.status(201).json({
-      ok: true,
-      group: toGroupResponse(group)
-    });
+      res.status(201).json({
+        ok: true,
+        group: toGroupResponse(group)
+      });
+    } catch (err: any) {
+      throw handlePrismaError(err);
+    }
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * POST /groups/circles - Create a new private circle
  * Authenticated users can create circles
  * Returns invite code for circle
  */
-router.post("/circles", requireAuth, async (req, res, next) => {
+router.post("/circles", requireAuth, asyncHandler(async (req: any, res: any, next: any) => {
   try {
     const userId = req.user!.id;
     const { name, description } = req.body;
 
     if (!name || typeof name !== "string") {
-      return res.status(400).json({
-        ok: false,
-        error: "name is required and must be a string"
-      });
+      throw new ValidationError("name is required and must be a string");
     }
 
     const prisma = res.app.get("prisma") as PrismaClient;
 
-    // Generate unique invite code
-    const inviteCode = generateInviteCode();
+    try {
+      // Generate unique invite code
+      const inviteCode = generateInviteCode();
 
-    // Create circle on blockchain first
-    const created = await create_group("circle", name.trim());
-    
-    // Create circle in database
-    const group = await prisma.group.create({
-      data: {
-        groupId: created.chainGroupId,
-        name: name.trim(),
-        description: description?.trim() || "",
-        type: "circle",
-        creatorId: userId,
+      // Create circle on blockchain first
+      const created = await create_group("circle", name.trim());
+      
+      // Create circle in database
+      const group = await prisma.group.create({
+        data: {
+          groupId: created.chainGroupId,
+          name: name.trim(),
+          description: description?.trim() || "",
+          type: "circle",
+          creatorId: userId,
+          inviteCode
+        } as any
+      });
+
+      // Add creator as first member
+      await prisma.membership.create({
+        data: {
+          memberId: userId,
+          groupId: group.id
+        }
+      });
+
+      logger.info("Circle created", { groupId: group.id, userId, name });
+
+      res.status(201).json({
+        ok: true,
+        group: toGroupResponse(group),
         inviteCode
-      } as any
-    });
-
-    // Add creator as first member
-    await prisma.membership.create({
-      data: {
-        memberId: userId,
-        groupId: group.id
-      }
-    });
-
-    logger.info("Circle created", { groupId: group.id, userId, name });
-
-    res.status(201).json({
-      ok: true,
-      group: toGroupResponse(group),
-      inviteCode
-    });
+      });
+    } catch (err: any) {
+      throw handlePrismaError(err);
+    }
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * POST /groups/join - Join a group
  * For rooms: no invite code needed
  * For circles: invite code is required
  */
-router.post("/join", requireAuth, async (req, res, next) => {
+router.post("/join", requireAuth, asyncHandler(async (req: any, res: any, next: any) => {
   try {
     const userId = req.user!.id;
     const { groupId, inviteCode } = req.body;
 
     if (!groupId || typeof groupId !== "string") {
-      return res.status(400).json({
-        ok: false,
-        error: "groupId is required and must be a string"
-      });
+      throw new ValidationError("groupId is required and must be a string");
     }
 
     const prisma = res.app.get("prisma") as PrismaClient;
 
-    // Get group
-    const group = await prisma.group.findUnique({
-      where: { id: groupId }
-    });
-
-    if (!group) {
-      return res.status(404).json({
-        ok: false,
-        error: "Group not found"
+    try {
+      // Get group
+      const group = await prisma.group.findUnique({
+        where: { id: groupId }
       });
-    }
 
-    // Check if user is already a member
-    const existingMembership = await prisma.membership.findFirst({
-      where: { memberId: userId, groupId }
-    });
-
-    if (existingMembership) {
-      return res.status(400).json({
-        ok: false,
-        error: "You are already a member of this group"
-      });
-    }
-
-    // For circles, validate invite code
-    if (group.type === "circle") {
-      if (!inviteCode || inviteCode !== (group as any).inviteCode) {
-        return res.status(403).json({
-          ok: false,
-          error: "Invalid invite code for circle"
-        });
+      if (!group) {
+        throw new NotFoundError("Group");
       }
-    }
 
-    // Create membership
-    await prisma.membership.create({
-      data: {
-        memberId: userId,
+      // Check if user is already a member
+      const existingMembership = await prisma.membership.findFirst({
+        where: { memberId: userId, groupId }
+      });
+
+      if (existingMembership) {
+        throw new ConflictError("You are already a member of this group");
+      }
+
+      // For circles, validate invite code
+      if (group.type === "circle") {
+        if (!inviteCode || inviteCode !== (group as any).inviteCode) {
+          throw new AuthorizationError("Invalid invite code for circle");
+        }
+      }
+
+      // Create membership
+      await prisma.membership.create({
+        data: {
+          memberId: userId,
+          groupId
+        }
+      });
+
+      logger.info("User joined group", { userId, groupId, groupType: group.type });
+
+      res.json({
+        ok: true,
+        message: `Joined ${group.name}`,
         groupId
-      }
-    });
-
-    logger.info("User joined group", { userId, groupId, groupType: group.type });
-
-    res.json({
-      ok: true,
-      message: `Joined ${group.name}`,
-      groupId
-    });
+      });
+    } catch (err: any) {
+      if (err instanceof AppError) throw err;
+      throw handlePrismaError(err);
+    }
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * GET /groups/:groupId/members - Get group members

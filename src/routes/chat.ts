@@ -7,6 +7,14 @@ import { Router, Response } from "express";
 import { PrismaClient } from "@prisma/client";
 import { createLogger } from "../logger.js";
 import { requireAuth } from "../auth.js";
+import {
+  AppError,
+  NotFoundError,
+  ValidationError,
+  AuthorizationError,
+  handlePrismaError,
+  asyncHandler
+} from "../error-handler.js";
 
 const logger = createLogger("chat-routes");
 const router = Router();
@@ -24,7 +32,7 @@ const sseClients = new Map<string, SSEClient>();
  * POST /chat - Send a message
  * Message is saved to database and broadcast to SSE clients
  */
-router.post("/", requireAuth, async (req, res, next) => {
+router.post("/", requireAuth, asyncHandler(async (req: any, res: any, next: any) => {
   try {
     const userId = req.user!.id;
     const { groupId, text, content, replyToId } = req.body;
@@ -33,25 +41,16 @@ router.post("/", requireAuth, async (req, res, next) => {
     const messageText = text || content;
 
     if (!groupId || typeof groupId !== "string") {
-      return res.status(400).json({
-        ok: false,
-        error: "groupId is required and must be a string"
-      });
+      throw new ValidationError("groupId is required and must be a string");
     }
 
     if (!messageText || typeof messageText !== "string") {
-      return res.status(400).json({
-        ok: false,
-        error: "text is required and must be a string"
-      });
+      throw new ValidationError("text is required and must be a string");
     }
 
     // Validate replyToId if provided
     if (replyToId && typeof replyToId !== "string") {
-      return res.status(400).json({
-        ok: false,
-        error: "replyToId must be a string"
-      });
+      throw new ValidationError("replyToId must be a string");
     }
 
     const prisma = res.app.get("prisma") as PrismaClient;
@@ -62,10 +61,7 @@ router.post("/", requireAuth, async (req, res, next) => {
     });
 
     if (!group) {
-      return res.status(404).json({
-        ok: false,
-        error: "Group not found"
-      });
+      throw new NotFoundError("Group");
     }
 
     // For circles, check membership before allowing chat
@@ -75,10 +71,7 @@ router.post("/", requireAuth, async (req, res, next) => {
       });
 
       if (!membership) {
-        return res.status(403).json({
-          ok: false,
-          error: "You are not a member of this circle. Cannot send messages."
-        });
+        throw new AuthorizationError("You are not a member of this circle. Cannot send messages.");
       }
     } else {
       // For rooms, check if user is a member (auto-join if not)
@@ -87,51 +80,60 @@ router.post("/", requireAuth, async (req, res, next) => {
       });
 
       if (!membership) {
-        await prisma.membership.create({
-          data: { memberId: userId, groupId }
-        });
+        try {
+          await prisma.membership.create({
+            data: { memberId: userId, groupId }
+          });
+        } catch (err: any) {
+          throw handlePrismaError(err);
+        }
       }
     }
 
     // Save message
-    const message = await prisma.chat.create({
-      data: {
-        text: messageText.trim(),
-        actorId: userId,
-        groupId,
-        blobId: "placeholder",
-        patchId: `chat-${Date.now()}`,
-        ...(replyToId && { replyToId })
-      },
-      include: {
-        actor: {
-          select: {
-            id: true,
-            walletAddress: true,
-            username: true,
-            displayName: true,
-            avatarPatchId: true
-          }
+    let message;
+    try {
+      message = await prisma.chat.create({
+        data: {
+          text: messageText.trim(),
+          actorId: userId,
+          groupId,
+          blobId: "placeholder",
+          patchId: `chat-${Date.now()}`,
+          ...(replyToId && { replyToId })
         },
-        replyTo: {
-          select: {
-            id: true,
-            text: true,
-            actorId: true,
-            createdAt: true,
-            actor: {
-              select: {
-                id: true,
-                walletAddress: true,
-                username: true,
-                displayName: true,
-                avatarPatchId: true
+        include: {
+          actor: {
+            select: {
+              id: true,
+              walletAddress: true,
+              username: true,
+              displayName: true,
+              avatarPatchId: true
+            }
+          },
+          replyTo: {
+            select: {
+              id: true,
+              text: true,
+              actorId: true,
+              createdAt: true,
+              actor: {
+                select: {
+                  id: true,
+                  walletAddress: true,
+                  username: true,
+                  displayName: true,
+                  avatarPatchId: true
+                }
               }
             }
           }
         }
-      }
-    } as any);
+      } as any);
+    } catch (err: any) {
+      throw handlePrismaError(err);
+    }
 
     // Broadcast to SSE clients in this group
     const msg = message as any;
@@ -180,7 +182,7 @@ router.post("/", requireAuth, async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * GET /chat/:groupId - Get chat history for a group
@@ -286,6 +288,189 @@ router.get("/:groupId", requireAuth, async (req, res, next) => {
         limit,
         total
       }
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * PATCH /chat/:messageId - Edit a message
+ * Only message author can edit
+ */
+router.patch("/:messageId", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user!.id;
+    const messageId = req.params.messageId;
+    const { text } = req.body;
+
+    if (!text || typeof text !== "string") {
+      return res.status(400).json({
+        ok: false,
+        error: "text is required and must be a string"
+      });
+    }
+
+    const prisma = res.app.get("prisma") as PrismaClient;
+
+    // Get message
+    const message = await prisma.chat.findUnique({
+      where: { id: messageId }
+    });
+
+    if (!message) {
+      return res.status(404).json({
+        ok: false,
+        error: "Message not found"
+      });
+    }
+
+    // Check if user is the author
+    if (message.actorId !== userId) {
+      return res.status(403).json({
+        ok: false,
+        error: "Only message author can edit"
+      });
+    }
+
+    // Update message
+    const updatedMessage = await prisma.chat.update({
+      where: { id: messageId },
+      data: { text: text.trim() },
+      include: {
+        actor: {
+          select: {
+            id: true,
+            walletAddress: true,
+            username: true,
+            displayName: true,
+            avatarPatchId: true
+          }
+        },
+        replyTo: {
+          select: {
+            id: true,
+            text: true,
+            actorId: true,
+            createdAt: true,
+            actor: {
+              select: {
+                id: true,
+                walletAddress: true,
+                username: true,
+                displayName: true,
+                avatarPatchId: true
+              }
+            }
+          }
+        }
+      }
+    } as any);
+
+    const msg = updatedMessage as any;
+
+    // Broadcast edit event
+    broadcast({
+      type: "message-edited",
+      groupId: msg.groupId,
+      message: {
+        id: msg.id,
+        text: msg.text,
+        actorId: msg.actorId,
+        groupId: msg.groupId,
+        actor: msg.actor,
+        replyToId: msg.replyToId,
+        replyTo: msg.replyTo ? {
+          id: msg.replyTo.id,
+          text: msg.replyTo.text,
+          actorId: msg.replyTo.actorId,
+          actor: msg.replyTo.actor,
+          createdAt: msg.replyTo.createdAt.toISOString()
+        } : null,
+        createdAt: msg.createdAt.toISOString(),
+        updatedAt: msg.updatedAt?.toISOString()
+      }
+    });
+
+    logger.info("Message edited", { userId, messageId });
+
+    res.json({
+      ok: true,
+      message: {
+        id: msg.id,
+        text: msg.text,
+        actorId: msg.actorId,
+        groupId: msg.groupId,
+        actor: msg.actor,
+        replyToId: msg.replyToId,
+        replyTo: msg.replyTo ? {
+          id: msg.replyTo.id,
+          text: msg.replyTo.text,
+          actorId: msg.replyTo.actorId,
+          actor: msg.replyTo.actor,
+          createdAt: msg.replyTo.createdAt.toISOString()
+        } : null,
+        createdAt: msg.createdAt.toISOString(),
+        updatedAt: msg.updatedAt?.toISOString()
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * DELETE /chat/:messageId - Delete a message
+ * Only message author can delete
+ */
+router.delete("/:messageId", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user!.id;
+    const messageId = req.params.messageId;
+
+    const prisma = res.app.get("prisma") as PrismaClient;
+
+    // Get message
+    const message = await prisma.chat.findUnique({
+      where: { id: messageId }
+    });
+
+    if (!message) {
+      return res.status(404).json({
+        ok: false,
+        error: "Message not found"
+      });
+    }
+
+    // Check if user is the author
+    if (message.actorId !== userId) {
+      return res.status(403).json({
+        ok: false,
+        error: "Only message author can delete"
+      });
+    }
+
+    const groupId = message.groupId;
+
+    // Delete message
+    await prisma.chat.delete({
+      where: { id: messageId }
+    });
+
+    // Broadcast delete event
+    broadcast({
+      type: "message-deleted",
+      groupId,
+      messageId,
+      deletedAt: new Date().toISOString()
+    });
+
+    logger.info("Message deleted", { userId, messageId });
+
+    res.json({
+      ok: true,
+      message: "Message deleted successfully",
+      messageId
     });
   } catch (err) {
     next(err);

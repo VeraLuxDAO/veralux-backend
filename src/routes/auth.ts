@@ -14,6 +14,14 @@ import {
   refreshAccessToken,
   isValidSuiAddress
 } from "../auth.js";
+import {
+  AppError,
+  NotFoundError,
+  ConflictError,
+  ValidationError,
+  handlePrismaError,
+  asyncHandler
+} from "../error-handler.js";
 
 const logger = createLogger("auth-routes");
 const router = Router();

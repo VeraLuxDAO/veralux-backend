@@ -7,6 +7,14 @@ import { Router } from "express";
 import { PrismaClient } from "@prisma/client";
 import { createLogger } from "../logger.js";
 import { requireAuth } from "../auth.js";
+import {
+  AppError,
+  NotFoundError,
+  ValidationError,
+  AuthorizationError,
+  handlePrismaError,
+  asyncHandler
+} from "../error-handler.js";
 
 const logger = createLogger("circles-routes");
 const router = Router();
@@ -182,7 +190,7 @@ router.post("/:groupId/regenerate-invite-code", requireAuth, async (req, res, ne
  * DELETE /circles/:groupId/members/:memberId - Remove member from circle
  * Only creator can remove members
  */
-router.delete("/:groupId/members/:memberId", requireAuth, async (req, res, next) => {
+router.delete("/:groupId/members/:memberId", requireAuth, asyncHandler(async (req: any, res: any, next: any) => {
   try {
     const userId = req.user!.id;
     const groupId = req.params.groupId;
@@ -190,67 +198,60 @@ router.delete("/:groupId/members/:memberId", requireAuth, async (req, res, next)
 
     const prisma = res.app.get("prisma") as PrismaClient;
 
-    // Get circle
-    const circle = await prisma.group.findUnique({
-      where: { id: groupId }
-    });
-
-    if (!circle) {
-      return res.status(404).json({ ok: false, error: "Circle not found" });
-    }
-
-    if (circle.type !== "circle") {
-      return res.status(400).json({
-        ok: false,
-        error: "This endpoint is only for circles"
+    try {
+      // Get circle
+      const circle = await prisma.group.findUnique({
+        where: { id: groupId }
       });
-    }
 
-    // Check if user is creator
-    if ((circle as any).creatorId !== userId) {
-      return res.status(403).json({
-        ok: false,
-        error: "Only circle creator can remove members"
+      if (!circle) {
+        throw new NotFoundError("Circle");
+      }
+
+      if (circle.type !== "circle") {
+        throw new AppError("This endpoint is only for circles", 400);
+      }
+
+      // Check if user is creator
+      if ((circle as any).creatorId !== userId) {
+        throw new AuthorizationError("Only circle creator can remove members");
+      }
+
+      // Cannot remove creator
+      if (memberId === (circle as any).creatorId) {
+        throw new AppError("Cannot remove circle creator", 400);
+      }
+
+      // Check if member exists
+      const membership = await prisma.membership.findFirst({
+        where: { memberId: memberId, groupId }
       });
-    }
 
-    // Cannot remove creator
-    if (memberId === (circle as any).creatorId) {
-      return res.status(400).json({
-        ok: false,
-        error: "Cannot remove circle creator"
+      if (!membership) {
+        throw new NotFoundError("Member");
+      }
+
+      // Remove member
+      await prisma.membership.delete({
+        where: { id: membership.id }
       });
-    }
 
-    // Check if member exists
-    const membership = await prisma.membership.findFirst({
-      where: { memberId: memberId, groupId }
-    });
+      logger.info("Member removed from circle", { groupId, memberId, removedBy: userId });
 
-    if (!membership) {
-      return res.status(404).json({
-        ok: false,
-        error: "Member not found in this circle"
+      res.json({
+        ok: true,
+        message: "Member removed from circle",
+        groupId,
+        memberId
       });
+    } catch (err: any) {
+      if (err instanceof AppError) throw err;
+      throw handlePrismaError(err);
     }
-
-    // Remove member
-    await prisma.membership.delete({
-      where: { id: membership.id }
-    });
-
-    logger.info("Member removed from circle", { groupId, memberId, removedBy: userId });
-
-    res.json({
-      ok: true,
-      message: "Member removed from circle",
-      groupId,
-      memberId
-    });
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * POST /circles/:groupId/leave - Leave a circle

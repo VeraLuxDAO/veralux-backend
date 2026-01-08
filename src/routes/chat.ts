@@ -4,9 +4,13 @@
  */
 
 import { Router, Response } from "express";
+import { z } from "zod";
 import { PrismaClient } from "@prisma/client";
 import { createLogger } from "../logger.js";
 import { requireAuth } from "../auth.js";
+import { sanitizeInput } from "../sanitizer.js";
+import { paginationSchema } from "../validators.js";
+import { setOnline, setOffline, touch } from "../presence.js";
 import {
   AppError,
   NotFoundError,
@@ -24,9 +28,14 @@ interface SSEClient {
   userId: string;
   response: Response;
   groupIds: Set<string>;
+  lastEventId: number;
+  heartbeat?: NodeJS.Timeout;
 }
 
 const sseClients = new Map<string, SSEClient>();
+let nextEventId = 1;
+const eventBuffer: Array<{ id: number; groupId?: string; payload: any }> = [];
+const MAX_BUFFER = 200;
 
 /**
  * POST /chat - Send a message
@@ -47,6 +56,23 @@ router.post("/", requireAuth, asyncHandler(async (req: any, res: any, next: any)
     if (!messageText || typeof messageText !== "string") {
       throw new ValidationError("text is required and must be a string");
     }
+
+    // Validate message length
+    if (messageText.trim().length === 0) {
+      throw new ValidationError("Message cannot be empty");
+    }
+
+    if (messageText.length > 2000) {
+      throw new ValidationError("Message cannot exceed 2000 characters");
+    }
+
+    // Sanitize message text
+    const sanitizedText = sanitizeInput(messageText, {
+      maxLength: 2000,
+      allowHtml: false,
+      stripTags: true,
+      normalizeSpace: false,
+    });
 
     // Validate replyToId if provided
     if (replyToId && typeof replyToId !== "string") {
@@ -95,7 +121,7 @@ router.post("/", requireAuth, asyncHandler(async (req: any, res: any, next: any)
     try {
       message = await prisma.chat.create({
         data: {
-          text: messageText.trim(),
+          text: sanitizedText,
           actorId: userId,
           groupId,
           blobId: "placeholder",
@@ -187,13 +213,25 @@ router.post("/", requireAuth, asyncHandler(async (req: any, res: any, next: any)
 /**
  * GET /chat/:groupId - Get chat history for a group
  * For circles, only members can access
+ * Supports pagination with limit/offset
  */
-router.get("/:groupId", requireAuth, async (req, res, next) => {
+router.get("/:groupId", requireAuth, asyncHandler(async (req: any, res: any, next: any) => {
   try {
     const userId = req.user!.id;
     const groupId = req.params.groupId;
-    const limit = Math.min(100, parseInt(req.query.limit as string) || 50);
-    const offset = Math.max(0, parseInt(req.query.offset as string) || 0);
+
+    // Validate pagination parameters
+    const paginationResult = paginationSchema.safeParse({
+      limit: req.query.limit,
+      offset: req.query.offset
+    });
+
+    if (!paginationResult.success) {
+      throw new ValidationError(paginationResult.error.issues[0].message);
+    }
+
+    const { limit = 20, offset = 0 } = paginationResult.data;
+    const finalLimit = Math.min(limit, 100); // Max 100 per request
 
     const prisma = res.app.get("prisma") as PrismaClient;
 
@@ -203,10 +241,7 @@ router.get("/:groupId", requireAuth, async (req, res, next) => {
     });
 
     if (!group) {
-      return res.status(404).json({
-        ok: false,
-        error: "Group not found"
-      });
+      throw new NotFoundError("Group");
     }
 
     // For circles, check membership
@@ -216,14 +251,11 @@ router.get("/:groupId", requireAuth, async (req, res, next) => {
       });
 
       if (!membership) {
-        return res.status(403).json({
-          ok: false,
-          error: "You are not a member of this circle. Cannot access messages."
-        });
+        throw new AuthorizationError("You are not a member of this circle. Cannot access messages.");
       }
     }
 
-    // Get messages
+    // Get messages with pagination
     const messages = await prisma.chat.findMany({
       where: { groupId },
       include: {
@@ -254,11 +286,12 @@ router.get("/:groupId", requireAuth, async (req, res, next) => {
           }
         }
       } as any,
-      take: limit,
+      take: finalLimit,
       skip: offset,
       orderBy: { createdAt: "asc" }
     });
 
+    // Get total count (cached if possible)
     const total = await prisma.chat.count({ where: { groupId } });
 
     // Format messages
@@ -276,7 +309,8 @@ router.get("/:groupId", requireAuth, async (req, res, next) => {
         actor: m.replyTo.actor,
         createdAt: m.replyTo.createdAt.toISOString()
       } : null,
-      createdAt: m.createdAt.toISOString()
+      createdAt: m.createdAt.toISOString(),
+      updatedAt: m.updatedAt?.toISOString()
     }));
 
     res.json({
@@ -285,14 +319,15 @@ router.get("/:groupId", requireAuth, async (req, res, next) => {
       messages: formattedMessages,
       pagination: {
         offset,
-        limit,
-        total
+        limit: finalLimit,
+        total,
+        hasMore: offset + finalLimit < total
       }
     });
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * PATCH /chat/:messageId - Edit a message
@@ -484,6 +519,8 @@ router.delete("/:messageId", requireAuth, async (req, res, next) => {
 router.get("/events/subscribe", requireAuth, (req, res, next) => {
   try {
     const userId = req.user!.id;
+    const lastEventIdHeader = req.headers["last-event-id"] as string | undefined;
+    const lastEventId = lastEventIdHeader ? Number(lastEventIdHeader) || 0 : 0;
 
     // Set SSE headers
     res.writeHead(200, {
@@ -498,18 +535,36 @@ router.get("/events/subscribe", requireAuth, (req, res, next) => {
     const sseClient: SSEClient = {
       userId,
       response: res,
-      groupIds: new Set()
+      groupIds: new Set(),
+      lastEventId
     };
 
     sseClients.set(clientId, sseClient);
     logger.info("SSE client connected", { clientId, userId });
 
+    // Presence: mark online
+    setOnline(userId);
+    broadcast({ type: "presence", userId, status: "online", ts: Date.now() });
+
     // Send initial connection confirmation
-    res.write(`data: ${JSON.stringify({ type: "connected", userId })}\n\n`);
+    res.write(`id: ${nextEventId++}\n` + `data: ${JSON.stringify({ type: "connected", userId })}\n\n`);
+
+    // Heartbeat
+    sseClient.heartbeat = setInterval(() => {
+      touch(userId);
+      try {
+        res.write(`: ping ${Date.now()}\n\n`);
+      } catch (err) {
+        clearInterval(sseClient.heartbeat!);
+      }
+    }, 25_000);
 
     // Handle client disconnect
     req.on("close", () => {
+      if (sseClient.heartbeat) clearInterval(sseClient.heartbeat);
       sseClients.delete(clientId);
+      setOffline(userId);
+      broadcast({ type: "presence", userId, status: "offline", ts: Date.now() });
       logger.info("SSE client disconnected", { clientId, userId });
     });
 
@@ -555,6 +610,7 @@ router.post("/events/subscribe-group", requireAuth, async (req, res, next) => {
     for (const [, client] of sseClients) {
       if (client.userId === userId) {
         client.groupIds.add(groupId);
+        replayBuffered(client, groupId);
       }
     }
 
@@ -605,20 +661,100 @@ router.post("/events/unsubscribe-group", requireAuth, async (req, res, next) => 
 });
 
 /**
+ * POST /chat/:groupId/typing - Typing indicators
+ */
+router.post("/:groupId/typing", requireAuth, asyncHandler(async (req: any, res: any, next: any) => {
+  try {
+    const userId = req.user!.id;
+    const { groupId } = req.params;
+    const { status } = req.body as { status?: string };
+
+    if (!status || !["start", "stop"].includes(status)) {
+      throw new ValidationError("status must be 'start' or 'stop'");
+    }
+
+    const prisma = res.app.get("prisma") as PrismaClient;
+    const membership = await prisma.membership.findFirst({ where: { memberId: userId, groupId } });
+    if (!membership) {
+      throw new AuthorizationError("Not a member of this group");
+    }
+
+    broadcast({ type: "typing", userId, groupId, status, ts: Date.now() });
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+}));
+
+/**
+ * POST /chat/:groupId/read - Read receipts
+ */
+router.post("/:groupId/read", requireAuth, asyncHandler(async (req: any, res: any, next: any) => {
+  try {
+    const userId = req.user!.id;
+    const { groupId } = req.params;
+    const { messageId } = req.body as { messageId?: string };
+
+    if (!messageId || typeof messageId !== "string") {
+      throw new ValidationError("messageId is required");
+    }
+
+    const prisma = res.app.get("prisma") as PrismaClient;
+
+    const membership = await prisma.membership.findFirst({ where: { memberId: userId, groupId } });
+    if (!membership) throw new AuthorizationError("Not a member of this group");
+
+    const message = await prisma.chat.findUnique({ where: { id: messageId } });
+    if (!message || message.groupId !== groupId) throw new NotFoundError("Message");
+
+    await (prisma as any).messageRead.upsert({
+      where: { userId_messageId: { userId, messageId } },
+      update: { readAt: new Date() },
+      create: { userId, messageId, groupId, readAt: new Date() }
+    });
+
+    broadcast({ type: "read_receipt", userId, groupId, messageId, ts: Date.now() });
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+}));
+
+/**
  * Broadcast event to all SSE clients in a group
  */
 function broadcast(event: any) {
-  const eventData = `data: ${JSON.stringify(event)}\n\n`;
+  const groupId = event.groupId;
+  const id = nextEventId++;
+  const payload = { ...event, id };
+
+  eventBuffer.push({ id, groupId, payload });
+  if (eventBuffer.length > MAX_BUFFER) eventBuffer.shift();
+
+  const eventData = `id: ${id}\n` + `data: ${JSON.stringify(payload)}\n\n`;
 
   for (const [, client] of sseClients) {
-    if (client.groupIds.has(event.groupId)) {
-      try {
-        client.response.write(eventData);
-      } catch (err) {
-        logger.error("Failed to broadcast to client", { error: err });
-      }
+    if (groupId && !client.groupIds.has(groupId)) continue;
+    try {
+      client.response.write(eventData);
+    } catch (err) {
+      logger.error("Failed to broadcast to client", { error: err });
     }
   }
+}
+
+function replayBuffered(client: SSEClient, groupId: string) {
+  for (const item of eventBuffer) {
+    if (item.id <= client.lastEventId) continue;
+    if (item.groupId && item.groupId !== groupId) continue;
+    const eventData = `id: ${item.id}\n` + `data: ${JSON.stringify(item.payload)}\n\n`;
+    try {
+      client.response.write(eventData);
+    } catch (err) {
+      logger.error("Failed to replay to client", { error: err });
+    }
+  }
+  client.lastEventId = nextEventId - 1;
 }
 
 // Export broadcast for use by other routes

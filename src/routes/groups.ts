@@ -4,9 +4,12 @@
  */
 
 import { Router } from "express";
+import { z } from "zod";
 import { PrismaClient } from "@prisma/client";
 import { createLogger } from "../logger.js";
 import { requireAuth } from "../auth.js";
+import { sanitizeInput } from "../sanitizer.js";
+import { paginationSchema } from "../validators.js";
 import { create_group } from "../blockchain.js";
 import {
   AppError,
@@ -20,6 +23,20 @@ import {
 
 const logger = createLogger("groups-routes");
 const router = Router();
+
+type MemberRole = "CREATOR" | "ADMIN" | "MODERATOR" | "MEMBER";
+
+async function getMembership(prisma: PrismaClient, groupId: string, userId: string) {
+  return prisma.membership.findFirst({ where: { groupId, memberId: userId } });
+}
+
+function isAdminRole(role?: MemberRole | null) {
+  return role === "CREATOR" || role === "ADMIN";
+}
+
+function canManageMembers(role?: MemberRole | null) {
+  return role === "CREATOR" || role === "ADMIN" || role === "MODERATOR";
+}
 
 /**
  * Helper: Convert Group model to Group response
@@ -39,17 +56,25 @@ function toGroupResponse(group: any, membersCount?: number) {
 }
 
 /**
- * GET /groups - Get all available groups
+ * GET /groups - Get all available groups with pagination
  * Returns public rooms and circles the user created or is a member of
- * If not authenticated, returns only public rooms
  */
-router.get("/", async (req, res, next) => {
+router.get("/", asyncHandler(async (req: any, res: any, next: any) => {
   try {
-    const page = Math.max(1, parseInt(req.query.page as string) || 1);
-    const limit = Math.min(50, parseInt(req.query.limit as string) || 20);
-    const skip = (page - 1) * limit;
-    const userId = (req as any).user?.id;
+    // Validate pagination
+    const paginationResult = paginationSchema.safeParse({
+      limit: req.query.limit,
+      offset: req.query.offset
+    });
 
+    if (!paginationResult.success) {
+      throw new ValidationError(paginationResult.error.issues[0].message);
+    }
+
+    const { limit = 20, offset = 0 } = paginationResult.data;
+    const finalLimit = Math.min(limit, 50); // Max 50 per request
+    
+    const userId = req.user?.id;
     const prisma = res.app.get("prisma") as PrismaClient;
 
     let groups;
@@ -72,8 +97,8 @@ router.get("/", async (req, res, next) => {
             { type: "circle", id: { in: memberGroupIds } }
           ]
         },
-        take: limit,
-        skip,
+        take: finalLimit,
+        skip: offset,
         orderBy: { createdAt: "desc" }
       });
       
@@ -90,28 +115,36 @@ router.get("/", async (req, res, next) => {
       // For unauthenticated users: show only public rooms
       groups = await prisma.group.findMany({
         where: { type: "room" },
-        take: limit,
-        skip,
+        take: finalLimit,
+        skip: offset,
         orderBy: { createdAt: "desc" }
       });
       
       total = await prisma.group.count({ where: { type: "room" } });
     }
 
+    // Format response with member counts
+    const groupsWithCounts = await Promise.all(
+      groups.map(async (g) => {
+        const membersCount = await prisma.membership.count({ where: { groupId: g.id } });
+        return toGroupResponse(g, membersCount);
+      })
+    );
+
     res.json({
       ok: true,
-      groups: groups.map(toGroupResponse),
+      groups: groupsWithCounts,
       pagination: {
-        page,
-        limit,
+        offset,
+        limit: finalLimit,
         total,
-        pages: Math.ceil(total / limit)
+        hasMore: offset + finalLimit < total
       }
     });
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * GET /groups/:groupId - Get group details
@@ -168,12 +201,13 @@ router.post("/rooms", requireAuth, asyncHandler(async (req: any, res: any, next:
         } as any
       });
 
-      // Add creator as first member
+      // Add creator as first member (creator role)
       await prisma.membership.create({
         data: {
           memberId: userId,
-          groupId: group.id
-        }
+          groupId: group.id,
+          role: "CREATOR"
+        } as any
       });
 
       logger.info("Room created", { groupId: group.id, userId, name });
@@ -229,8 +263,9 @@ router.post("/circles", requireAuth, asyncHandler(async (req: any, res: any, nex
       await prisma.membership.create({
         data: {
           memberId: userId,
-          groupId: group.id
-        }
+          groupId: group.id,
+          role: "CREATOR"
+        } as any
       });
 
       logger.info("Circle created", { groupId: group.id, userId, name });
@@ -294,8 +329,9 @@ router.post("/join", requireAuth, asyncHandler(async (req: any, res: any, next: 
       await prisma.membership.create({
         data: {
           memberId: userId,
-          groupId
-        }
+          groupId,
+          role: "MEMBER"
+        } as any
       });
 
       logger.info("User joined group", { userId, groupId, groupType: group.type });
@@ -334,11 +370,12 @@ router.get("/:groupId/members", requireAuth, async (req, res, next) => {
       return res.status(404).json({ ok: false, error: "Group not found" });
     }
 
-    // Check if user is creator
-    if ((group as any).creatorId !== userId) {
+    // Check membership role
+    const membership = await getMembership(prisma, groupId, userId);
+    if (!membership || !isAdminRole((membership as any).role)) {
       return res.status(403).json({
         ok: false,
-        error: "Only group creator can view members"
+        error: "Only group creator or admin can view members"
       });
     }
 
@@ -369,6 +406,7 @@ router.get("/:groupId/members", requireAuth, async (req, res, next) => {
         username: m.member?.username,
         displayName: m.member?.displayName,
         avatarPatchId: m.member?.avatarPatchId,
+        role: (m as any).role,
         joinedAt: m.createdAt?.toISOString()
       }))
     });
@@ -376,6 +414,47 @@ router.get("/:groupId/members", requireAuth, async (req, res, next) => {
     next(err);
   }
 });
+
+/**
+ * POST /groups/:groupId/members/:memberId/role - Update member role
+ * Only creator can change roles; cannot demote creator
+ */
+router.post("/:groupId/members/:memberId/role", requireAuth, asyncHandler(async (req: any, res: any, next: any) => {
+  try {
+    const userId = req.user!.id;
+    const { groupId, memberId } = req.params;
+    const { role } = req.body as { role?: MemberRole };
+
+    if (!role || !["ADMIN", "MODERATOR", "MEMBER"].includes(role)) {
+      throw new ValidationError("role must be one of ADMIN, MODERATOR, MEMBER");
+    }
+
+    const prisma = res.app.get("prisma") as PrismaClient;
+
+    const requester = await getMembership(prisma, groupId, userId);
+    if (!requester || (requester as any).role !== "CREATOR") {
+      throw new AuthorizationError("Only the group creator can change roles");
+    }
+
+    const target = await getMembership(prisma, groupId, memberId);
+    if (!target) {
+      throw new NotFoundError("Membership");
+    }
+
+    if ((target as any).role === "CREATOR") {
+      throw new AuthorizationError("Cannot change the creator's role");
+    }
+
+    await prisma.membership.update({
+      where: { id: target.id },
+      data: { role } as any
+    });
+
+    res.json({ ok: true, groupId, memberId, role });
+  } catch (err) {
+    next(err);
+  }
+}));
 
 /**
  * Helper: Generate unique 6-character invite code

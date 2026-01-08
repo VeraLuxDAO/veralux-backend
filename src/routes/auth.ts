@@ -6,13 +6,16 @@
 import { Router } from "express";
 import { PrismaClient } from "@prisma/client";
 import { createLogger } from "../logger.js";
+import { loginBruteForceMiddleware, recordSuccessfulLogin } from "../rate-limiter.js";
 import {
-  generateTokens,
-  hashRefreshToken,
+  authNonceSchema,
+  authLoginSchema
+} from "../validators.js";
+import {
   requireAuth,
-  verifyRefreshToken,
   refreshAccessToken,
-  isValidSuiAddress
+  createNonce,
+  authenticateWithWallet
 } from "../auth.js";
 import {
   AppError,
@@ -43,74 +46,48 @@ function toUserProfile(user: any) {
 }
 
 /**
- * POST /auth - Simple wallet-based login (Temporary - No signature verification)
- *
- * Creates or logs in user by wallet address only.
- * TODO: Implement signature verification in the future.
- *
- * @body walletAddress - The Sui wallet address
- * @returns Access token, refresh token, and user profile
+ * GET /auth/nonce - Request a nonce to sign
  */
-router.post("/", async (req, res, next) => {
+router.get("/nonce", asyncHandler(async (req: any, res: any, next: any) => {
   try {
-    const walletAddress = (req.body.walletAddress ?? "").toString();
-
-    if (!walletAddress) {
-      return res.status(400).json({
-        ok: false,
-        error: "walletAddress is required",
-        code: "MISSING_WALLET_ADDRESS"
-      });
+    const parse = authNonceSchema.safeParse({ walletAddress: req.query.walletAddress });
+    if (!parse.success) {
+      throw new ValidationError(parse.error.issues[0].message);
     }
 
-    if (!isValidSuiAddress(walletAddress)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid Sui wallet address format",
-        code: "INVALID_WALLET_ADDRESS"
-      });
+    const { walletAddress } = parse.data;
+    const prisma = res.app.get("prisma") as PrismaClient;
+    const { nonce, message, expiresAt } = await createNonce(prisma, walletAddress);
+
+    res.json({ ok: true, walletAddress, nonce, message, expiresAt });
+  } catch (err) {
+    next(err);
+  }
+}));
+
+/**
+ * POST /auth - Wallet-based login with signature verification
+ *
+ * Flow: client requests /auth/nonce → signs message → POST /auth with walletAddress + signature
+ */
+router.post("/", loginBruteForceMiddleware, asyncHandler(async (req: any, res: any, next: any) => {
+  try {
+    const parsed = authLoginSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw new ValidationError(parsed.error.issues[0].message);
     }
 
-    const normalizedAddress = walletAddress.toLowerCase();
+    const { walletAddress, signature } = parsed.data;
     const prisma = res.app.get("prisma") as PrismaClient;
 
-    // Find or create user
-    let user = await prisma.user.findUnique({
-      where: { walletAddress: normalizedAddress }
-    });
-
-    if (!user) {
-      // Create new user
-      user = await prisma.user.create({
-        data: {
-          walletAddress: normalizedAddress,
-          lastLoginAt: new Date()
-        }
-      });
-      logger.info("New user created", { userId: user.id, walletAddress: normalizedAddress });
-    } else {
-      // Update last login
-      user = await prisma.user.update({
-        where: { id: user.id },
-        data: { lastLoginAt: new Date() }
-      });
-      logger.info("User logged in", { userId: user.id, walletAddress: normalizedAddress });
+    const result = await authenticateWithWallet(prisma, walletAddress, signature);
+    if ("error" in result) {
+      throw new ValidationError(result.error);
     }
 
-    // Generate tokens
-    const tokens = generateTokens(user.id, normalizedAddress);
-    const hashedRefreshToken = hashRefreshToken(tokens.refreshToken);
+    recordSuccessfulLogin(walletAddress.toLowerCase());
 
-    // Store refresh token
-    const refreshTokenExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
-    await prisma.user.update({
-      where: { id: user.id },
-      data: {
-        refreshToken: hashedRefreshToken,
-        refreshTokenExpiresAt
-      }
-    });
-
+    const { user, tokens } = result;
     res.json({
       ok: true,
       accessToken: tokens.accessToken,
@@ -121,7 +98,7 @@ router.post("/", async (req, res, next) => {
   } catch (err) {
     next(err);
   }
-});
+}));
 
 /**
  * POST /auth/refresh - Refresh access token

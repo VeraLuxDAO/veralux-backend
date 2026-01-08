@@ -6,6 +6,8 @@ import swaggerUi from "swagger-ui-express";
 import { PrismaClient } from "@prisma/client";
 import { createLogger } from "./logger.js";
 import { errorHandler } from "./error-handler.js";
+import { rateLimitMiddleware, loginBruteForceMiddleware } from "./rate-limiter.js";
+import { sanitizeUserInput } from "./sanitizer.js";
 import {
   assertNoExternalLinks,
   authLoginSchema,
@@ -47,6 +49,7 @@ import authRoutes from "./routes/auth.js";
 import groupRoutes from "./routes/groups.js";
 import circleRoutes from "./routes/circles.js";
 import chatRoutes from "./routes/chat.js";
+import userRoutes from "./routes/users.js";
 
 const logger = createLogger("api");
 logger.info("Initializing Prisma client");
@@ -87,6 +90,9 @@ app.use(cors({
 }));
 app.use(express.json({ limit: "2mb" }));
 
+// Apply rate limiting to all routes
+app.use(rateLimitMiddleware);
+
 /* ------------------------------ SWAGGER UI ------------------------------- */
 app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
   customSiteTitle: "YNX Backend API",
@@ -98,6 +104,7 @@ app.use("/auth", authRoutes);
 app.use("/groups", groupRoutes);
 app.use("/circles", circleRoutes);
 app.use("/chat", chatRoutes);
+app.use("/users", userRoutes);
 
 /* ------------------------------ SSE: /events ------------------------------ */
 type SSEClient = { id: number; res: express.Response; userId?: number };

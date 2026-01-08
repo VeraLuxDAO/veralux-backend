@@ -104,35 +104,146 @@ export const updateProfileSchema = z.object({
 });
 
 // =============================================================================
-// Flow Schemas
+// Pagination Schemas
 // =============================================================================
+
+/**
+ * Pagination parameters for list endpoints
+ */
+export const paginationSchema = z.object({
+  limit: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(100)
+    .default(20)
+    .optional(),
+  offset: z.coerce
+    .number()
+    .int()
+    .nonnegative()
+    .default(0)
+    .optional(),
+  cursor: z.string().optional()
+});
+
+// =============================================================================
+// Chat Message Schemas
+// =============================================================================
+
+export const postChatSchema = z.object({
+  text: z
+    .string()
+    .min(1, "Message cannot be empty")
+    .max(2000, "Message cannot exceed 2000 characters"),
+  groupId: z
+    .string()
+    .min(1, "Group ID is required"),
+  replyToId: z
+    .string()
+    .optional()
+});
+
+/**
+ * Edit message schema
+ */
+export const editChatSchema = z.object({
+  text: z
+    .string()
+    .min(1, "Message cannot be empty")
+    .max(2000, "Message cannot exceed 2000 characters")
+});
 
 // =============================================================================
 // Flow Schemas
 // =============================================================================
 
 export const postFlowTextSchema = z.object({
-  text: z.string().min(1).max(2000)
+  text: z
+    .string()
+    .min(1, "Flow text is required")
+    .max(5000, "Flow text cannot exceed 5000 characters")
 });
 
 export const postGlowSchema = z.object({
-  flowPatchId: z.string().min(10)
+  flowPatchId: z
+    .string()
+    .min(10, "Invalid flow patch ID")
 });
 
 export const postPromoteSchema = z.object({
-  flowPatchId: z.string().min(10)
+  flowPatchId: z
+    .string()
+    .min(10, "Invalid flow patch ID")
 });
+
+// =============================================================================
+// Group & Circle Schemas
+// =============================================================================
 
 export const postGroupSchema = z.object({
   type: z.enum(["room", "circle"]),
-  name: z.string().min(1).max(80)
+  name: z
+    .string()
+    .min(1, "Group name is required")
+    .max(80, "Group name cannot exceed 80 characters")
+});
+
+/**
+ * Edit group schema
+ */
+export const editGroupSchema = z.object({
+  name: z
+    .string()
+    .min(1, "Group name is required")
+    .max(80, "Group name cannot exceed 80 characters")
+    .optional(),
+  description: z
+    .string()
+    .max(500, "Description cannot exceed 500 characters")
+    .optional()
 });
 
 export const postJoinSchema = z.object({
-  groupId: z.string().min(1)
+  groupId: z
+    .string()
+    .min(1, "Group ID is required"),
+  inviteCode: z
+    .string()
+    .optional()
 });
 
-export const postChatSchema = z.object({
-  text: z.string().min(1).max(2000),
-  groupId: z.string().min(1) // Required for chat messages
+// =============================================================================
+// Search Schemas
+// =============================================================================
+
+export const userSearchSchema = z.object({
+  query: z
+    .string()
+    .min(1, "Search query is required")
+    .max(50, "Search query cannot exceed 50 characters"),
+  limit: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(50)
+    .optional()
+    .default(20)
+});
+
+export const messageSearchSchema = z.object({
+  query: z
+    .string()
+    .min(1, "Search query is required")
+    .max(100, "Search query cannot exceed 100 characters"),
+  groupId: z
+    .string()
+    .min(1, "Group ID is required"),
+  limit: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(50)
+    .optional()
+    .default(20)
 });

@@ -7,52 +7,288 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// =============================================================================
+// USER AUTHENTICATION
+// =============================================================================
+// Users are identified by their Sui wallet address. Authentication flow:
+// 1. Client requests a nonce from /auth/nonce
+// 2. Client signs the nonce with their wallet
+// 3. Client submits signature to /auth - creates user if new, returns JWT
+// 4. JWT is used for authenticated requests
+model User {
+  id            String    @id @default(cuid())
+  walletAddress String    @unique  // Sui wallet address (primary identifier)
+  nonce         String?            // Random nonce for signature verification
+  nonceExpiresAt DateTime?         // Nonce expiration time
+  
+  // Profile info (optional, can be updated later)
+  username      String?   @unique
+  displayName   String?
+  avatarBlobId  String?            // Walrus blob ID for profile avatar
+  avatarPatchId String?            // Walrus patch ID for profile avatar
+  bio           String?
+  
+  // Session management
+  refreshToken  String?   @unique  // Hashed refresh token for token renewal
+  refreshTokenExpiresAt DateTime?  // Refresh token expiration
+  
+  // Timestamps
+  lastLoginAt   DateTime  @default(now())
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  
+  // Relations
+  flows         Flow[]    @relation("FlowAuthor")
+  glows         Glow[]    @relation("GlowActor")
+  promotes      Promote[] @relation("PromoteActor")
+  memberships   Membership[] @relation("MembershipUser")
+  chats         Chat[]    @relation("ChatActor")
+  groupsCreated Group[]   @relation("GroupCreator")
+  blockedUsers  UserBlock[] @relation("UserBlocks")
+  blockedBy     UserBlock[] @relation("UserBlockedBy")
+  messageReads  MessageRead[]
+  messageReactions MessageReaction[]
+  comments      Comment[] @relation("CommentAuthor")
+  
+  @@index([walletAddress])
+}
+
 enum FlowType {
   TEXT
   IMAGE
 }
 
+// Flow = A post (text or image)
+// 
+// HOW TO FETCH DATA:
+// - For TEXT: use patchId with aggregator → {aggregator}/v1/blobs/by-quilt-patch-id/{patchId}
+// - For IMAGE: use imagePatchId with aggregator → {aggregator}/v1/blobs/by-quilt-patch-id/{imagePatchId}
+//
 model Flow {
-  id          String   @id @default(cuid())
-  type        FlowType
-  walrusHash  String   @unique
-  imageHash   String?  // if type=IMAGE, points to raw image blob in Walrus
-  mime        String?
-  createdAt   DateTime @default(now())
-  authorId    String?  // optional user
+  id            String    @id @default(cuid())
+  type          FlowType
+  
+  // === BLOB ID === (the quilt container - for reference only)
+  blobId        String    // Walrus blob ID for flow metadata
+  imageBlobId   String?   // Walrus blob ID for image (only for IMAGE type)
+  
+  // === PATCH ID === (USE THIS TO FETCH DATA!)
+  patchId       String    @unique  // Walrus patch ID for flow metadata JSON
+  imagePatchId  String?   // Walrus patch ID for image file (only for IMAGE type)
+  
+  mime          String?
+  createdAt     DateTime  @default(now())
+  
+  // Author relation
+  authorId      String?
+  author        User?     @relation("FlowAuthor", fields: [authorId], references: [id])
+  
+  // Comments relation
+  comments      Comment[] @relation("FlowComments")
+  
+  @@index([authorId])
+  @@index([createdAt])
 }
 
 model Glow {
   id          String   @id @default(cuid())
-  flowHash    String   // references Flow.walrusHash
-  walrusHash  String   // glow log in Walrus (immutable)
-  actorId     String?
+  flowPatchId String   // Flow.patchId that was glowed
+  blobId      String   // Walrus blob ID
+  patchId     String   // Walrus patch ID for glow action
   createdAt   DateTime @default(now())
-  @@index([flowHash])
+  
+  // Actor relation
+  actorId     String?
+  actor       User?    @relation("GlowActor", fields: [actorId], references: [id])
+  
+  @@index([flowPatchId])
+  @@index([actorId])
 }
 
 model Promote {
   id              String   @id @default(cuid())
-  flowHash        String
-  walrusHash      String
+  flowPatchId     String   // Flow.patchId that was promoted
+  blobId          String   // Walrus blob ID
+  patchId         String   // Walrus patch ID for promote action
   visibilityBoost Int      @default(10)
-  actorId         String?
   createdAt       DateTime @default(now())
-  @@index([flowHash])
+  
+  // Actor relation
+  actorId         String?
+  actor           User?    @relation("PromoteActor", fields: [actorId], references: [id])
+  
+  @@index([flowPatchId])
+  @@index([actorId])
 }
 
 model Group {
-  id         String   @id @default(cuid()) // off-chain id
-  groupId    String   @unique              // on-chain id or stubbed
-  type       String                         // "room" | "circle"
+  id         String   @id @default(cuid())
+  groupId    String   @unique  // on-chain id
+  type       String            // "room" | "circle"
   name       String
+  description String?  // Group description
+  inviteCode String?  @unique  // Invite code for circles (null for rooms)
+  creatorId  String?  // User who created the group
+  creator    User?    @relation("GroupCreator", fields: [creatorId], references: [id])
+  blobId     String?  // Walrus blob ID for group metadata
+  patchId    String?  // Walrus patch ID for group metadata
   createdAt  DateTime @default(now())
+  
+  @@index([type])
+  @@index([inviteCode])
+  @@index([creatorId])
 }
 
 model Membership {
   id        String   @id @default(cuid())
   groupId   String
-  memberId  String
+  role      MemberRole @default(MEMBER)
   createdAt DateTime @default(now())
+  
+  // Member relation
+  memberId  String?
+  member    User?    @relation("MembershipUser", fields: [memberId], references: [id])
+  
   @@index([groupId])
+  @@index([memberId])
+  @@index([groupId, role])
+}
+
+// User block list
+model UserBlock {
+  id         String   @id @default(cuid())
+  blockerId  String
+  blockedId  String
+  createdAt  DateTime @default(now())
+
+  blocker    User     @relation("UserBlocks", fields: [blockerId], references: [id])
+  blocked    User     @relation("UserBlockedBy", fields: [blockedId], references: [id])
+
+  @@unique([blockerId, blockedId])
+  @@index([blockerId])
+  @@index([blockedId])
+}
+
+// Message read receipts
+model MessageRead {
+  id         String   @id @default(cuid())
+  userId     String
+  messageId  String
+  groupId    String
+  readAt     DateTime @default(now())
+
+  user       User     @relation(fields: [userId], references: [id])
+  message    Chat     @relation(fields: [messageId], references: [id])
+
+  @@unique([userId, messageId])
+  @@index([groupId, userId])
+  @@index([userId, readAt])
+}
+
+enum MemberRole {
+  CREATOR
+  ADMIN
+  MODERATOR
+  MEMBER
+}
+
+model Chat {
+  id        String   @id @default(cuid())
+  groupId   String   // Group.groupId (blockchain ID)
+  text      String
+  blobId    String   // Walrus blob ID
+  patchId   String   // Walrus patch ID
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt  // For tracking edits
+  
+  // Author relation
+  actorId   String?
+  actor     User?    @relation("ChatActor", fields: [actorId], references: [id])
+  
+  // Reply feature
+  replyToId String?  // ID of the message being replied to
+  replyTo   Chat?    @relation("ChatReply", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies   Chat[]   @relation("ChatReply")
+  reads     MessageRead[]
+  reactions MessageReaction[]
+  
+  @@index([groupId])
+  @@index([actorId])
+  @@index([createdAt])
+  @@index([replyToId])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  action    String   // AuditAction enum value
+  actorId   String   // User who performed the action
+  targetId  String   // Resource/user being acted upon
+  groupId   String?  // Optional group context
+  details   String?  // JSON details of the action
+  timestamp DateTime @default(now())
+  
+  @@index([actorId])
+  @@index([targetId])
+  @@index([groupId])
+  @@index([timestamp])
+}
+
+model MessageReaction {
+  id        String   @id @default(cuid())
+  userId    String
+  messageId String
+  emoji     String   // Emoji character
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  message   Chat     @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, messageId, emoji])
+  @@index([messageId])
+  @@index([userId])
+}
+
+model MemberBan {
+  id           String   @id @default(cuid())
+  groupId      String
+  bannedUserId String
+  bannedBy     String   // User who banned
+  reason       String?
+  createdAt    DateTime @default(now())
+
+  @@index([groupId, bannedUserId])
+  @@unique([groupId, bannedUserId])
+}
+
+// =============================================================================
+// COMMENTS SYSTEM (Flow posts only)
+// =============================================================================
+// Supports threaded comments with parent-child relationships
+// Includes soft delete functionality
+model Comment {
+  id        String   @id @default(cuid())
+  content   String   // Comment text content
+  
+  // Author relation
+  authorId  String
+  author    User     @relation("CommentAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  
+  // Flow relation (comments are only for flows)
+  flowId    String
+  flow      Flow     @relation("FlowComments", fields: [flowId], references: [id], onDelete: Cascade)
+  
+  // Threading support (nested replies)
+  parentId  String?
+  parent    Comment? @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies   Comment[] @relation("CommentReplies")
+  
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime? // Soft delete timestamp
+  
+  @@index([flowId])
+  @@index([authorId])
+  @@index([parentId])
+  @@index([createdAt])
 }

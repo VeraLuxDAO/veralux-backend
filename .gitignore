@@ -1,2 +1,6 @@
 node_modules/
 .env
+sui-contracts/build/
+myfile.txt
+dist
+.DS_Store

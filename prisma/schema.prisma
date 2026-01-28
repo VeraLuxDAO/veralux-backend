@@ -47,6 +47,8 @@ model User {
   blockedUsers  UserBlock[] @relation("UserBlocks")
   blockedBy     UserBlock[] @relation("UserBlockedBy")
   messageReads  MessageRead[]
+  messageReactions MessageReaction[]
+  comments      Comment[] @relation("CommentAuthor")
   
   @@index([walletAddress])
 }
@@ -80,6 +82,9 @@ model Flow {
   // Author relation
   authorId      String?
   author        User?     @relation("FlowAuthor", fields: [authorId], references: [id])
+  
+  // Comments relation
+  comments      Comment[] @relation("FlowComments")
   
   @@index([authorId])
   @@index([createdAt])
@@ -205,9 +210,85 @@ model Chat {
   replyTo   Chat?    @relation("ChatReply", fields: [replyToId], references: [id], onDelete: SetNull)
   replies   Chat[]   @relation("ChatReply")
   reads     MessageRead[]
+  reactions MessageReaction[]
   
   @@index([groupId])
   @@index([actorId])
   @@index([createdAt])
   @@index([replyToId])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  action    String   // AuditAction enum value
+  actorId   String   // User who performed the action
+  targetId  String   // Resource/user being acted upon
+  groupId   String?  // Optional group context
+  details   String?  // JSON details of the action
+  timestamp DateTime @default(now())
+  
+  @@index([actorId])
+  @@index([targetId])
+  @@index([groupId])
+  @@index([timestamp])
+}
+
+model MessageReaction {
+  id        String   @id @default(cuid())
+  userId    String
+  messageId String
+  emoji     String   // Emoji character
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  message   Chat     @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, messageId, emoji])
+  @@index([messageId])
+  @@index([userId])
+}
+
+model MemberBan {
+  id           String   @id @default(cuid())
+  groupId      String
+  bannedUserId String
+  bannedBy     String   // User who banned
+  reason       String?
+  createdAt    DateTime @default(now())
+
+  @@index([groupId, bannedUserId])
+  @@unique([groupId, bannedUserId])
+}
+
+// =============================================================================
+// COMMENTS SYSTEM (Flow posts only)
+// =============================================================================
+// Supports threaded comments with parent-child relationships
+// Includes soft delete functionality
+model Comment {
+  id        String   @id @default(cuid())
+  content   String   // Comment text content
+  
+  // Author relation
+  authorId  String
+  author    User     @relation("CommentAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+  
+  // Flow relation (comments are only for flows)
+  flowId    String
+  flow      Flow     @relation("FlowComments", fields: [flowId], references: [id], onDelete: Cascade)
+  
+  // Threading support (nested replies)
+  parentId  String?
+  parent    Comment? @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies   Comment[] @relation("CommentReplies")
+  
+  // Timestamps
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime? // Soft delete timestamp
+  
+  @@index([flowId])
+  @@index([authorId])
+  @@index([parentId])
+  @@index([createdAt])
 }

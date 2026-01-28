@@ -11,6 +11,7 @@ import { requireAuth } from "../auth.js";
 import { sanitizeInput } from "../sanitizer.js";
 import { paginationSchema } from "../validators.js";
 import { create_group } from "../blockchain.js";
+import { verifyCaptcha } from "../middleware/captcha.js";
 import {
   AppError,
   NotFoundError,
@@ -46,12 +47,12 @@ function toGroupResponse(group: any, membersCount?: number) {
   return {
     id: group.id,
     name: group.name,
-    description: (group as any).description,
+    description: group.description,
     type: group.type,
-    creatorId: (group as any).creatorId,
+    creatorId: group.creatorId,
     createdAt: group.createdAt?.toISOString() ?? new Date().toISOString(),
     membersCount: membersCount ?? 0,
-    hasInviteCode: !!(group as any).inviteCode
+    hasInviteCode: !!group.inviteCode
   };
 }
 
@@ -93,7 +94,7 @@ router.get("/", asyncHandler(async (req: any, res: any, next: any) => {
         where: {
           OR: [
             { type: "room" },
-            { type: "circle", creatorId: userId as any },
+            { type: "circle", creatorId: userId },
             { type: "circle", id: { in: memberGroupIds } }
           ]
         },
@@ -106,7 +107,7 @@ router.get("/", asyncHandler(async (req: any, res: any, next: any) => {
         where: {
           OR: [
             { type: "room" },
-            { type: "circle", creatorId: userId as any },
+            { type: "circle", creatorId: userId },
             { type: "circle", id: { in: memberGroupIds } }
           ]
         }
@@ -175,7 +176,7 @@ router.get("/:groupId", async (req, res, next) => {
  * POST /groups/rooms - Create a new public room
  * Authenticated users can create rooms
  */
-router.post("/rooms", requireAuth, asyncHandler(async (req: any, res: any, next: any) => {
+router.post("/rooms", requireAuth, verifyCaptcha, asyncHandler(async (req: any, res: any, next: any) => {
   try {
     const userId = req.user!.id;
     const { name, description } = req.body;
@@ -198,7 +199,7 @@ router.post("/rooms", requireAuth, asyncHandler(async (req: any, res: any, next:
           description: description?.trim() || "",
           type: "room",
           creatorId: userId
-        } as any
+        }
       });
 
       // Add creator as first member (creator role)
@@ -207,7 +208,7 @@ router.post("/rooms", requireAuth, asyncHandler(async (req: any, res: any, next:
           memberId: userId,
           groupId: group.id,
           role: "CREATOR"
-        } as any
+        }
       });
 
       logger.info("Room created", { groupId: group.id, userId, name });
@@ -229,7 +230,7 @@ router.post("/rooms", requireAuth, asyncHandler(async (req: any, res: any, next:
  * Authenticated users can create circles
  * Returns invite code for circle
  */
-router.post("/circles", requireAuth, asyncHandler(async (req: any, res: any, next: any) => {
+router.post("/circles", requireAuth, verifyCaptcha, asyncHandler(async (req: any, res: any, next: any) => {
   try {
     const userId = req.user!.id;
     const { name, description } = req.body;
@@ -256,7 +257,7 @@ router.post("/circles", requireAuth, asyncHandler(async (req: any, res: any, nex
           type: "circle",
           creatorId: userId,
           inviteCode
-        } as any
+        }
       });
 
       // Add creator as first member
@@ -265,7 +266,7 @@ router.post("/circles", requireAuth, asyncHandler(async (req: any, res: any, nex
           memberId: userId,
           groupId: group.id,
           role: "CREATOR"
-        } as any
+        }
       });
 
       logger.info("Circle created", { groupId: group.id, userId, name });
@@ -288,7 +289,7 @@ router.post("/circles", requireAuth, asyncHandler(async (req: any, res: any, nex
  * For rooms: no invite code needed
  * For circles: invite code is required
  */
-router.post("/join", requireAuth, asyncHandler(async (req: any, res: any, next: any) => {
+router.post("/join", requireAuth, verifyCaptcha, asyncHandler(async (req: any, res: any, next: any) => {
   try {
     const userId = req.user!.id;
     const { groupId, inviteCode } = req.body;
@@ -320,7 +321,7 @@ router.post("/join", requireAuth, asyncHandler(async (req: any, res: any, next: 
 
       // For circles, validate invite code
       if (group.type === "circle") {
-        if (!inviteCode || inviteCode !== (group as any).inviteCode) {
+        if (!inviteCode || inviteCode !== group.inviteCode) {
           throw new AuthorizationError("Invalid invite code for circle");
         }
       }
@@ -331,7 +332,7 @@ router.post("/join", requireAuth, asyncHandler(async (req: any, res: any, next: 
           memberId: userId,
           groupId,
           role: "MEMBER"
-        } as any
+        }
       });
 
       logger.info("User joined group", { userId, groupId, groupType: group.type });
@@ -372,7 +373,7 @@ router.get("/:groupId/members", requireAuth, async (req, res, next) => {
 
     // Check membership role
     const membership = await getMembership(prisma, groupId, userId);
-    if (!membership || !isAdminRole((membership as any).role)) {
+    if (!membership || !isAdminRole(membership.role)) {
       return res.status(403).json({
         ok: false,
         error: "Only group creator or admin can view members"
@@ -406,7 +407,7 @@ router.get("/:groupId/members", requireAuth, async (req, res, next) => {
         username: m.member?.username,
         displayName: m.member?.displayName,
         avatarPatchId: m.member?.avatarPatchId,
-        role: (m as any).role,
+        role: m.role,
         joinedAt: m.createdAt?.toISOString()
       }))
     });
@@ -432,7 +433,7 @@ router.post("/:groupId/members/:memberId/role", requireAuth, asyncHandler(async 
     const prisma = res.app.get("prisma") as PrismaClient;
 
     const requester = await getMembership(prisma, groupId, userId);
-    if (!requester || (requester as any).role !== "CREATOR") {
+    if (!requester || requester.role !== "CREATOR") {
       throw new AuthorizationError("Only the group creator can change roles");
     }
 
@@ -441,13 +442,13 @@ router.post("/:groupId/members/:memberId/role", requireAuth, asyncHandler(async 
       throw new NotFoundError("Membership");
     }
 
-    if ((target as any).role === "CREATOR") {
+    if (target.role === "CREATOR") {
       throw new AuthorizationError("Cannot change the creator's role");
     }
 
     await prisma.membership.update({
       where: { id: target.id },
-      data: { role } as any
+      data: { role }
     });
 
     res.json({ ok: true, groupId, memberId, role });

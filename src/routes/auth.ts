@@ -7,6 +7,7 @@ import { Router } from "express";
 import { PrismaClient } from "@prisma/client";
 import { createLogger } from "../logger.js";
 import { loginBruteForceMiddleware, recordSuccessfulLogin } from "../rate-limiter.js";
+import { verifyCaptcha } from "../middleware/captcha.js";
 import {
   authNonceSchema,
   authLoginSchema
@@ -48,7 +49,7 @@ function toUserProfile(user: any) {
 /**
  * GET /auth/nonce - Request a nonce to sign
  */
-router.get("/nonce", asyncHandler(async (req: any, res: any, next: any) => {
+router.get("/nonce", verifyCaptcha, asyncHandler(async (req: any, res: any, next: any) => {
   try {
     const parse = authNonceSchema.safeParse({ walletAddress: req.query.walletAddress });
     if (!parse.success) {
@@ -70,7 +71,7 @@ router.get("/nonce", asyncHandler(async (req: any, res: any, next: any) => {
  *
  * Flow: client requests /auth/nonce → signs message → POST /auth with walletAddress + signature
  */
-router.post("/", loginBruteForceMiddleware, asyncHandler(async (req: any, res: any, next: any) => {
+router.post("/", verifyCaptcha, loginBruteForceMiddleware, asyncHandler(async (req: any, res: any, next: any) => {
   try {
     const parsed = authLoginSchema.safeParse(req.body);
     if (!parsed.success) {

@@ -8,6 +8,7 @@ import { createLogger } from "./logger.js";
 import { errorHandler } from "./error-handler.js";
 import { rateLimitMiddleware, loginBruteForceMiddleware } from "./rate-limiter.js";
 import { sanitizeUserInput } from "./sanitizer.js";
+import { metricsMiddleware, metricsCollector } from "./metrics.js";
 import {
   assertNoExternalLinks,
   authLoginSchema,
@@ -43,6 +44,10 @@ import {
   requireAuth,
   updateUserProfile
 } from "./auth.js";
+import { setupReactionsRoutes } from "./routes/reactions.js";
+import { setupModerationRoutes } from "./routes/moderation.js";
+import { setupAuditRoutes } from "./routes/audit.js";
+import { versioningMiddleware, API_CURRENT_VERSION } from "./versioning.js";
 
 // Route modules
 import authRoutes from "./routes/auth.js";
@@ -50,6 +55,7 @@ import groupRoutes from "./routes/groups.js";
 import circleRoutes from "./routes/circles.js";
 import chatRoutes from "./routes/chat.js";
 import userRoutes from "./routes/users.js";
+import commentsRoutes from "./routes/comments.js";
 
 const logger = createLogger("api");
 logger.info("Initializing Prisma client");
@@ -93,6 +99,12 @@ app.use(express.json({ limit: "2mb" }));
 // Apply rate limiting to all routes
 app.use(rateLimitMiddleware);
 
+// Apply metrics collection
+app.use(metricsMiddleware);
+
+// Apply API versioning
+app.use(versioningMiddleware);
+
 /* ------------------------------ SWAGGER UI ------------------------------- */
 app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
   customSiteTitle: "YNX Backend API",
@@ -100,18 +112,25 @@ app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
 }));
 
 /* ------------------------------ ROUTE MODULES ------------------------------- */
-app.use("/auth", authRoutes);
-app.use("/groups", groupRoutes);
-app.use("/circles", circleRoutes);
-app.use("/chat", chatRoutes);
-app.use("/users", userRoutes);
+app.use("/v1/auth", authRoutes);
+app.use("/v1/groups", groupRoutes);
+app.use("/v1/circles", circleRoutes);
+app.use("/v1/chat", chatRoutes);
+app.use("/v1/users", userRoutes);
+app.use("/v1/flows", commentsRoutes);
+app.use("/v1/comments", commentsRoutes);
 
-/* ------------------------------ SSE: /events ------------------------------ */
+// Setup advanced routes with versioning
+setupReactionsRoutes(app, prisma, "/v1");
+setupModerationRoutes(app, prisma, "/v1");
+setupAuditRoutes(app, prisma, "/v1");
+
+/* ------------------------------ SSE: /v1/events ------------------------------ */
 type SSEClient = { id: number; res: express.Response; userId?: number };
 const clients = new Map<number, SSEClient>();
 let nextClientId = 1;
 
-app.get("/events", optionalAuth, (req, res) => {
+app.get("/v1/events", optionalAuth, (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
@@ -814,6 +833,32 @@ app.get("/verify", async (req, res, next) => {
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
+});
+
+/**
+ * GET /metrics
+ * Get current performance metrics
+ */
+app.get("/metrics", (_req, res) => {
+  res.json({
+    stats: metricsCollector.getStats(),
+    recentRequests: metricsCollector.getMetrics(10)
+  });
+});
+
+/**
+ * GET /metrics/:method/:path
+ * Get metrics for specific endpoint
+ */
+app.get("/metrics/:method/:path", (req, res) => {
+  const { method, path } = req.params;
+  const stats = metricsCollector.getEndpointStats(method, path);
+  
+  if (!stats) {
+    return res.status(404).json({ error: "No metrics found for this endpoint" });
+  }
+  
+  res.json({ endpoint: `${method} ${path}`, stats });
 });
 
 // Centralized error handling middleware (must be last)
